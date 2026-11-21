@@ -1,0 +1,35 @@
+name = "club-reservation-bot"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+
+# Кожні 5 хв: нагадування за 30 хв до початку, зведення в годину відкриття, дочитування статусу K
+# для щойно записаних броней. Один тригер на все (на безкоштовному плані 5 cron на акаунт).
+[triggers]
+crons = ["*/5 * * * *"]
+
+# Workers AI — запасний розбір повідомлень (модель див. src/ai.ts).
+[ai]
+binding = "AI"
+
+# Зберігати логи: Workers & Pages → club-reservation-bot → Logs.
+[observability]
+enabled = true
+
+[vars]
+# Telegram ID власника (число, рядком).
+OWNER_ID = "8769109427"
+TZ = "Europe/Warsaw"
+SHEET_ID = "1ZTh4vIN7AEc49d4y3xXlZjB3TpM2VIuYxyh7_N2pvKc"
+# JSON із відповіді getMe — заповнюється після /setup, щоб не викликати getMe на кожен запит.
+BOT_INFO = '{"id":9232099581,"is_bot":true,"first_name":"Reservation_Assistant_bot","username":"Vadeclubreservation_bot","can_join_groups":true,"can_read_all_group_messages":false,"supports_inline_queries":false,"supports_guest_queries":false,"can_connect_to_business":false,"has_main_web_app":false,"has_topics_enabled":false,"allows_users_to_create_topics":false,"can_manage_bots":false,"supports_join_request_queries":false}'
+
+# Секрети (у git не потрапляють):
+#   npx.cmd wrangler secret put BOT_TOKEN
+#   npx.cmd wrangler secret put WEBHOOK_SECRET
+#   GOOGLE_SA_KEY — див. README / SPEC.md (заливається з файлу, без виводу на екран)
+
+[[d1_databases]]
+binding = "DB"
+database_name = "club-reservations"
+database_id = "b189ef43-9b3f-4b9e-8725-0865ccf5f6f0"
+migrations_dir = "migrations"

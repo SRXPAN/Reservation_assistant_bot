@@ -1,0 +1,36 @@
+{
+  "name": "club-reservation-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:live": "vitest run --config vitest.live.config.ts",
+    "typecheck": "tsc --noEmit",
+    "devvars:key": "node scripts/devvars-key.mjs",
+    "secret:token": "node scripts/put-secret.mjs BOT_TOKEN",
+    "secret:key": "node scripts/put-secret.mjs GOOGLE_SA_KEY",
+    "secret:webhook": "node scripts/put-secret.mjs WEBHOOK_SECRET --generate",
+    "bot:setup": "node scripts/call.mjs /setup",
+    "bot:status": "node scripts/call.mjs /status",
+    "bot:check": "node scripts/call.mjs /run-check",
+    "db:migrate:local": "wrangler d1 migrations apply club-reservations --local",
+    "db:migrate": "wrangler d1 migrations apply club-reservations --remote"
+  },
+  "dependencies": {
+    "grammy": "^1.30.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261110.1",
+    "@types/node": "^26.6.6",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0",
+    "wrangler": "^4.0.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "workerd@1.20261110.1": true
+  }
+}

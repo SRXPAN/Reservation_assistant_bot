@@ -1,0 +1,7 @@
+# Скопіюйте в .dev.vars (файл у .gitignore) — значення для локального запуску `npm run dev` і `npm run test:live`.
+# На Cloudflare секрети задаються через `npx.cmd wrangler secret put ...`.
+BOT_TOKEN=
+WEBHOOK_SECRET=
+WORKER_URL=
+# Ключ сервісного акаунта вписує скрипт `npm run devvars:key` (читає файл з "C:\Users\vadek\Desktop\DONT TOUCH").
+GOOGLE_SA_KEY=

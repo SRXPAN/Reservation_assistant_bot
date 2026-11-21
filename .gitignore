@@ -1,0 +1,13 @@
+node_modules/
+.wrangler/
+dist/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.env
+.env.*
+*.log
+backup*.sql
+# Ключі сервісного акаунта Google ніколи не мають потрапити в репозиторій.
+*.json.key
+sincere-tape-*.json
