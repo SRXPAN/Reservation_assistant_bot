@@ -75,7 +75,13 @@ describe("текст картки", () => {
 
 describe("міграції", () => {
   it("застосовуються по порядку на чисту базу", () => {
-    expect(readdirSync("migrations").sort()).toEqual(["0001_init.sql", "0002_cards.sql", "0003_prompts_generic.sql", "0004_reminders.sql"]);
+    expect(readdirSync("migrations").sort()).toEqual([
+      "0001_init.sql",
+      "0002_cards.sql",
+      "0003_prompts_generic.sql",
+      "0004_reminders.sql",
+      "0005_client_bookings.sql",
+    ]);
     expect(() => fakeD1()).not.toThrow();
   });
 

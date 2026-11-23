@@ -87,3 +87,63 @@ export function withAttendance(note: string, came: boolean, by: string, at: stri
   const mark = `${came ? "✅ прийшов" : "❌ не прийшов"} (${by} ${at})`;
   return clean ? `${clean} · ${mark}` : mark;
 }
+
+/* ───────────── клієнтські нагадування за 30 хв ───────────── */
+
+export const clientReminderKey = (e: Pick<Entry, "id" | "start">): string => `cr:${e.id}:${e.start}`;
+
+export interface ClientReminderAction {
+  kind: "client_reminder";
+  key: string;
+  entry: Entry;
+  clientTgId: number;
+  minutesLeft: number;
+  started: boolean;
+}
+
+export interface ClientPlanInput {
+  entries: Entry[];
+  clientOwners: Map<string, number>;
+  now: number;
+  sent: Set<string>;
+}
+
+export function planClientReminders(input: ClientPlanInput): ClientReminderAction[] {
+  const { entries, clientOwners, now, sent } = input;
+  const actions: ClientReminderAction[] = [];
+  for (const e of entries) {
+    if (!e.id) continue;
+    const clientTgId = clientOwners.get(e.id);
+    if (clientTgId === undefined) continue;
+    if (e.start - REMIND_BEFORE > now || e.end <= now) continue;
+    const key = clientReminderKey(e);
+    if (sent.has(key)) continue;
+    actions.push({
+      kind: "client_reminder",
+      key,
+      entry: e,
+      clientTgId,
+      minutesLeft: Math.max(0, e.start - now),
+      started: e.start <= now,
+    });
+  }
+  return actions;
+}
+
+export function clientReminderText(a: Pick<ClientReminderAction, "entry" | "minutesLeft" | "started">, pcList: number[]): string {
+  const e = a.entry;
+  const pcs = pcsLabel(e.pcs, pcList);
+  if (a.started) {
+    return `⏰ Нагадуємо: ваша бронь ${pcs} уже почалась (${formatHHMM(e.start)}–${formatHHMM(e.end)}). Все в силі?`;
+  }
+  return `⏰ Нагадуємо: ваша бронь ${pcs} починається о ${formatHHMM(e.start)} (через ${a.minutesLeft} хв). Все в силі?`;
+}
+
+const CLIENT_CONFIRM_RX = /\s*(?:·\s*)?клієнт підтвердив \([^)]*\)/gu;
+
+/** Примітка з підтвердженням клієнта (попередня позначка підтвердження замінюється). */
+export function withClientConfirm(note: string, at: string): string {
+  const clean = note.replace(CLIENT_CONFIRM_RX, "").trim();
+  const mark = `клієнт підтвердив (${at})`;
+  return clean ? `${clean} · ${mark}` : mark;
+}

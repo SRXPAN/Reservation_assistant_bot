@@ -128,3 +128,96 @@ export async function audit(
     .bind(e.user_id ?? null, e.user_name ?? null, e.action, e.card_id ?? null, e.details === undefined ? null : JSON.stringify(e.details))
     .run();
 }
+
+/* ───────────── клієнтський самозапис ───────────── */
+
+export interface ClientBookingRow {
+  booking_id: string;
+  client_tg_id: number;
+  status: "active" | "cancelled";
+  created_at: string;
+}
+
+export async function saveClientBooking(db: D1Database, bookingId: string, clientTgId: number): Promise<void> {
+  await db
+    .prepare(
+      `INSERT OR REPLACE INTO client_bookings (booking_id, client_tg_id, status)
+       VALUES (?1, ?2, 'active')`,
+    )
+    .bind(bookingId, clientTgId)
+    .run();
+}
+
+export async function markClientBookingCancelled(db: D1Database, bookingId: string): Promise<void> {
+  await db.prepare("UPDATE client_bookings SET status = 'cancelled' WHERE booking_id = ?1").bind(bookingId).run();
+}
+
+export async function getClientBooking(db: D1Database, bookingId: string): Promise<ClientBookingRow | null> {
+  return db.prepare("SELECT * FROM client_bookings WHERE booking_id = ?1").bind(bookingId).first<ClientBookingRow>();
+}
+
+export async function listClientBookings(db: D1Database, clientTgId: number): Promise<ClientBookingRow[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM client_bookings WHERE client_tg_id = ?1 AND status = 'active' ORDER BY created_at DESC")
+    .bind(clientTgId)
+    .all<ClientBookingRow>();
+  return results;
+}
+
+export async function listActiveClientBookingOwners(db: D1Database, bookingIds: string[]): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
+  if (!bookingIds.length) return map;
+  // D1 обмежує кількість параметрів у одному SQL-запиті (~100), тому ділимо на пачки.
+  for (let i = 0; i < bookingIds.length; i += 50) {
+    const chunk = bookingIds.slice(i, i + 50);
+    const placeholders = chunk.map((_, idx) => `?${idx + 1}`).join(", ");
+    const { results } = await db
+      .prepare(`SELECT booking_id, client_tg_id FROM client_bookings WHERE status = 'active' AND booking_id IN (${placeholders})`)
+      .bind(...chunk)
+      .all<{ booking_id: string; client_tg_id: number }>();
+    for (const r of results) map.set(r.booking_id, r.client_tg_id);
+  }
+  return map;
+}
+
+export interface ClientSessionRow {
+  user_id: number;
+  message_id: number | null;
+  step: string;
+  data: string;
+  updated_at: string;
+}
+
+export async function getClientSession(db: D1Database, userId: number): Promise<ClientSessionRow | null> {
+  return db.prepare("SELECT * FROM client_sessions WHERE user_id = ?1").bind(userId).first<ClientSessionRow>();
+}
+
+export async function saveClientSession(
+  db: D1Database,
+  s: { user_id: number; message_id: number | null; step: string; data: unknown },
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO client_sessions (user_id, message_id, step, data, updated_at)
+       VALUES (?1, ?2, ?3, ?4, datetime('now'))
+       ON CONFLICT (user_id) DO UPDATE SET
+         message_id = excluded.message_id,
+         step = excluded.step,
+         data = excluded.data,
+         updated_at = datetime('now')`,
+    )
+    .bind(s.user_id, s.message_id, s.step, JSON.stringify(s.data))
+    .run();
+}
+
+export async function transitionClientSession(db: D1Database, userId: number, fromStep: string, toStep: string): Promise<boolean> {
+  const res = await db
+    .prepare("UPDATE client_sessions SET step = ?3, updated_at = datetime('now') WHERE user_id = ?1 AND step = ?2")
+    .bind(userId, fromStep, toStep)
+    .run();
+  return (res.meta.changes ?? 0) === 1;
+}
+
+export async function clearClientSession(db: D1Database, userId: number): Promise<void> {
+  await db.prepare("DELETE FROM client_sessions WHERE user_id = ?1").bind(userId).run();
+}

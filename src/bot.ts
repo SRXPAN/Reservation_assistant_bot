@@ -4,6 +4,7 @@ import { Bot, type Context } from "grammy";
 import type { Message, UserFromGetMe } from "grammy/types";
 import type { AiBinding } from "./ai";
 import { menuKeyboard } from "./card";
+import { onClientCallback, onClientContact, onClientStart, onClientText, type ClientUser } from "./client_flow";
 import { getConfig, sheetUrl, type Env } from "./config";
 import { auditText, onBookingText, onCallback, onMenu, onPromptReply, type Deps, type Who } from "./flow";
 import { onAttendance } from "./reminders";
@@ -23,6 +24,17 @@ const ANONYMOUS_ADMIN = 1087968824;
 const who = (ctx: Context): Who => {
   const u = ctx.from!;
   return { id: u.id, name: [u.first_name, u.last_name].filter(Boolean).join(" ") || u.username || String(u.id) };
+};
+
+const clientUser = (ctx: Context): ClientUser => {
+  const u = ctx.from!;
+  return {
+    id: u.id,
+    first_name: u.first_name,
+    last_name: u.last_name,
+    username: u.username,
+    displayName: [u.first_name, u.last_name].filter(Boolean).join(" ") || u.username || String(u.id),
+  };
 };
 
 /** Гілка повідомлення: для тем — message_thread_id, для «General» і звичайних груп — null. */
@@ -81,13 +93,12 @@ export function createBot(env: Env, opts: BotOptions): Bot {
     await setBinding(env.DB, { ...binding, menu_message_id: menu.message_id });
   }
 
-  // /start: прив'язка гілки (лише власник); у прив'язаній гілці — оновити меню.
+  // /start: у ЛС — клієнтське меню; у групі — прив'язка гілки (лише власник) або оновлення адмін-меню.
   bot.command("start", async (ctx) => {
     const chat = ctx.chat;
     if (chat.type === "private") {
-      if (isOwner(ctx)) {
-        await ctx.reply("Додайте мене в робочу групу адміністратором і напишіть /start у гілці «Reservation» — я запропоную її прив'язати.");
-      }
+      if (ctx.from?.is_bot) return;
+      await onClientStart(deps, clientUser(ctx));
       return;
     }
     const thread = threadOf(ctx.msg);
@@ -143,22 +154,29 @@ export function createBot(env: Env, opts: BotOptions): Bot {
     await audit(env.DB, { user_id: ctx.from.id, user_name: who(ctx).name, action: "bind", details: binding });
   });
 
-  // Кнопки меню і карток — лише в прив'язаній гілці.
+  // Кнопки: у ЛС (c:*) — клієнтський режим; у групі — лише прив'язана гілка.
   bot.on("callback_query:data", async (ctx) => {
     const msg = ctx.callbackQuery.message;
-    const binding = await getBinding(env.DB);
-    const thread = msg ? threadOf(msg as Message) : null;
-    if (!msg || !inBinding(binding, msg.chat.id, thread)) {
-      await ctx.answerCallbackQuery();
-      return;
-    }
+    const data = ctx.callbackQuery.data;
     let answered = false;
     const answer = async (r: { toast?: string; alert?: boolean }) => {
       if (answered) return;
       answered = true;
       await ctx.answerCallbackQuery({ text: r.toast, show_alert: r.alert }).catch(() => {});
     };
-    const data = ctx.callbackQuery.data;
+
+    if (msg?.chat.type === "private" && data.startsWith("c:")) {
+      await onClientCallback(deps, { data, chat_id: msg.chat.id, message_id: msg.message_id }, clientUser(ctx), answer);
+      if (!answered) await ctx.answerCallbackQuery().catch(() => {});
+      return;
+    }
+
+    const binding = await getBinding(env.DB);
+    const thread = msg ? threadOf(msg as Message) : null;
+    if (!msg || !inBinding(binding, msg.chat.id, thread)) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
     if (data.startsWith("m:")) await onMenu(deps, data.slice(2), { chat_id: msg.chat.id, thread_id: thread }, who(ctx), answer);
     else if (data.startsWith("a:")) {
       const [act, id] = data.slice(2).split("|");
@@ -167,13 +185,28 @@ export function createBot(env: Env, opts: BotOptions): Bot {
     if (!answered) await ctx.answerCallbackQuery().catch(() => {});
   });
 
-  // Текст у прив'язаній гілці: відповідь на запит поля або нова бронь. Решту групи ігноруємо.
+  // Контакт (номер телефону) у ЛС клієнта.
+  bot.on("message:contact", async (ctx) => {
+    if (ctx.chat.type !== "private" || ctx.from?.is_bot) return;
+    await onClientContact(
+      deps,
+      { chat_id: ctx.chat.id, message_id: ctx.msg.message_id, phone_number: ctx.msg.contact.phone_number },
+      clientUser(ctx),
+    );
+  });
+
+  // Текст: у ЛС — лише кроки клієнтського майстра (без адмін-парсера); у групі — прив'язана гілка.
   bot.on("message:text", async (ctx) => {
+    if (ctx.from.is_bot) return;
+    const text = ctx.msg.text;
+    if (ctx.chat.type === "private") {
+      if (text.startsWith("/")) return;
+      await onClientText(deps, { chat_id: ctx.chat.id, message_id: ctx.msg.message_id, text }, clientUser(ctx));
+      return;
+    }
     const binding = await getBinding(env.DB);
     const thread = threadOf(ctx.msg);
     if (!inBinding(binding, ctx.chat.id, thread)) return;
-    if (ctx.from.is_bot) return;
-    const text = ctx.msg.text;
     const reply = ctx.msg.reply_to_message;
     if (reply && reply.from?.id === ctx.me.id) {
       const handled = await onPromptReply(

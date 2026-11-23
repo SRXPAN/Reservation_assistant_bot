@@ -7,10 +7,22 @@
 // - запис під замком у D1, після запису перечитуємо рядок і перевіряємо свій ID;
 // - рядок шукаємо за ID у колонці U, а не за номером.
 
-import { FIRST_ROW, LAST_ROW, freeRows, parseBookingRows, rowValues, splitIntoRuns, type NewBooking, type SheetBooking } from "./bookings";
+import {
+  FIRST_ROW,
+  LAST_ROW,
+  bookingInterval,
+  findConflicts,
+  freeRows,
+  parseBookingRows,
+  rowValues,
+  splitIntoRuns,
+  type Conflict,
+  type NewBooking,
+  type SheetBooking,
+} from "./bookings";
 import { cacheDelete, cacheGet, cachePut, withLock } from "./db";
 import { getAccessToken, resetTokenMemory, type FetchFn } from "./google";
-import { parseSchedule, type DaySchedule } from "./hours";
+import { isWithinHours, parseSchedule, type DaySchedule } from "./hours";
 import { fractionToMinutes } from "./time";
 
 export const BOOKINGS = "Бронювання";
@@ -58,6 +70,21 @@ export class SheetFullError extends Error {
 }
 
 export class WriteVerifyError extends Error {}
+
+export class BookingConflictError extends Error {
+  constructor(
+    readonly conflicts: Conflict[],
+    readonly bookings: SheetBooking[],
+  ) {
+    super("Обрані ПК вже зайнято на цей час");
+  }
+}
+
+export class BookingOutOfHoursError extends Error {
+  constructor() {
+    super("Обраний час виходить за межі робочих годин клубу");
+  }
+}
 
 /** Запит до Sheets API з токеном. На 401 — один повтор зі свіжим токеном. */
 async function call<T>(ctx: SheetCtx, path: string, init: { method?: string; body?: unknown } = {}): Promise<T> {
@@ -197,6 +224,47 @@ export async function placeBooking(ctx: SheetCtx, booking: NewBooking, id: strin
       a: ab?.[i]?.[0],
       b: ab?.[i]?.[1],
       f: f?.[i]?.[0],
+    }));
+    const rows = freeRows(cells).slice(0, runs.length);
+    if (rows.length < runs.length) throw new SheetFullError(runs.length);
+
+    await batchUpdate(
+      ctx,
+      rows.flatMap((row, i) => [
+        { range: range(BOOKINGS, `A${row}:H${row}`), values: [rowValues(booking, runs[i]!)] },
+        { range: range(BOOKINGS, `U${row}`), values: [[id]] },
+      ]),
+    );
+    return rows;
+  }, LOCK_OPTS);
+}
+
+/**
+ * Атомарний запис клієнтської броні під замком D1:
+ * перечитує свіжу таблицю, перевіряє години й накладки, і лише тоді записує у вільні рядки.
+ */
+export async function placeClientBooking(
+  ctx: SheetCtx,
+  booking: NewBooking,
+  id: string,
+  pcList: number[],
+  schedule: DaySchedule[],
+): Promise<number[]> {
+  const runs = splitIntoRuns(booking.pcs, pcList);
+  if (!runs.length) throw new Error("Жодного ПК зі списку «Налаштування» не вибрано");
+
+  return withLock(ctx.db, WRITE_LOCK, async () => {
+    const [raw] = await batchGet(ctx, [range(BOOKINGS, `A${FIRST_ROW}:U${LAST_ROW}`)]);
+    const freshBookings = parseBookingRows(raw ?? []);
+    const { start, end } = bookingInterval(booking.date, booking.from, booking.to);
+    if (!isWithinHours(schedule, booking.date, start, end)) throw new BookingOutOfHoursError();
+    const conflicts = findConflicts({ pcs: booking.pcs, start, end }, freshBookings);
+    if (conflicts.length) throw new BookingConflictError(conflicts, freshBookings);
+
+    const cells = Array.from({ length: LAST_ROW - FIRST_ROW + 1 }, (_, i) => ({
+      a: raw?.[i]?.[0],
+      b: raw?.[i]?.[1],
+      f: raw?.[i]?.[5],
     }));
     const rows = freeRows(cells).slice(0, runs.length);
     if (rows.length < runs.length) throw new SheetFullError(runs.length);

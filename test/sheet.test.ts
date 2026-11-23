@@ -3,10 +3,13 @@ import { tryLock } from "../src/db";
 import { resetTokenMemory } from "../src/google";
 import {
   BOOKINGS,
+  BookingConflictError,
   BookingMissingError,
+  BookingOutOfHoursError,
   SETTINGS,
   SheetFullError,
   placeBooking,
+  placeClientBooking,
   replaceBooking,
   verifyBooking,
   WriteVerifyError,
@@ -181,5 +184,44 @@ describe("заголовок U9", () => {
     expect(await ensureIdHeader(ctx)).toBe(false);
     google.set(BOOKINGS, 9, 20, "Щось інше");
     await expect(ensureIdHeader(ctx)).rejects.toThrow(/U9 уже зайнята/);
+  });
+});
+
+describe("атомарний клієнтський запис під замком", () => {
+  it("перевіряє свіжу таблицю на накладку і години перед записом", async () => {
+    const settings = await loadSettings(ctx);
+    // У таблиці вже є бронь на вт ПК 5 18:00–20:00
+    google.setRow(BOOKINGS, 12, sheetRow({ date: TUE, b: 5, from: "18:00", to: "20:00", name: "Хтось" }));
+    await expect(
+      placeClientBooking(
+        ctx,
+        { date: TUE, pcs: [5], from: 19 * 60, to: 21 * 60, name: "Клієнт", contact: "@u", note: "клієнт через бот" },
+        "R-cl-1",
+        PC_LIST,
+        settings.schedule,
+      ),
+    ).rejects.toThrow(BookingConflictError);
+
+    // Поза годинами роботи (вт о 09:00)
+    await expect(
+      placeClientBooking(
+        ctx,
+        { date: TUE, pcs: [5], from: 9 * 60, to: 11 * 60, name: "Клієнт", contact: "@u", note: "клієнт через бот" },
+        "R-cl-2",
+        PC_LIST,
+        settings.schedule,
+      ),
+    ).rejects.toThrow(BookingOutOfHoursError);
+
+    // Вільний слот 20:00–22:00 записується успішно
+    const rows = await placeClientBooking(
+      ctx,
+      { date: TUE, pcs: [5], from: 20 * 60, to: 22 * 60, name: "Клієнт", contact: "@u", note: "клієнт через бот" },
+      "R-cl-3",
+      PC_LIST,
+      settings.schedule,
+    );
+    expect(rows).toEqual([13]);
+    expect(google.get(BOOKINGS, 13, 20)).toBe("R-cl-3");
   });
 });

@@ -1,7 +1,19 @@
 import { describe, expect, it } from "vitest";
 import { parseBookingRows } from "../src/bookings";
 import { parseSchedule } from "../src/hours";
-import { planNotifications, reminderKey, reminderText, summaryKey, summaryTime, withAttendance, type Action } from "../src/notify";
+import {
+  clientReminderKey,
+  clientReminderText,
+  planClientReminders,
+  planNotifications,
+  reminderKey,
+  reminderText,
+  summaryKey,
+  summaryTime,
+  withAttendance,
+  withClientConfirm,
+  type Action,
+} from "../src/notify";
 import { dateToSerial } from "../src/time";
 import { toEntries } from "../src/views";
 import { CLUB_HOURS_ROWS, PC_LIST, sheetRow } from "./helpers";
@@ -121,5 +133,26 @@ describe("відмітка в примітці", () => {
     const once = withAttendance("день народження", true, "Сеня", "18:55");
     expect(once).toBe("день народження · ✅ прийшов (Сеня 18:55)");
     expect(withAttendance(once, false, "Оля", "19:20")).toBe("день народження · ❌ не прийшов (Оля 19:20)");
+  });
+});
+
+describe("клієнтські нагадування за 30 хв", () => {
+  it("planClientReminders планує лише броні з clientOwners без дублів", () => {
+    const owners = new Map<string, number>([["R-vova", 777]]);
+    expect(planClientReminders({ entries, clientOwners: owners, now: at(FRI, 18, 25), sent: new Set() })).toEqual([]);
+    const list = planClientReminders({ entries, clientOwners: owners, now: at(FRI, 18, 30), sent: new Set() });
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({ kind: "client_reminder", key: clientReminderKey(vova), clientTgId: 777, minutesLeft: 30, started: false });
+    expect(clientReminderText(list[0]!, PC_LIST)).toBe(
+      "⏰ Нагадуємо: ваша бронь ПК 12–17 (6 ПК) починається о 19:00 (через 30 хв). Все в силі?",
+    );
+    expect(planClientReminders({ entries, clientOwners: owners, now: at(FRI, 18, 35), sent: new Set([clientReminderKey(vova)]) })).toEqual([]);
+  });
+
+  it("withClientConfirm додає і замінює відмітку підтвердження в примітці", () => {
+    const first = withClientConfirm("клієнт через бот", "18:35");
+    expect(first).toBe("клієнт через бот · клієнт підтвердив (18:35)");
+    expect(withClientConfirm(first, "18:40")).toBe("клієнт через бот · клієнт підтвердив (18:40)");
+    expect(withClientConfirm("", "18:40")).toBe("клієнт підтвердив (18:40)");
   });
 });

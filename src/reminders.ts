@@ -3,9 +3,17 @@
 import { complete } from "./bookings";
 import { esc } from "./card";
 import type { Deps, Who } from "./flow";
-import { planNotifications, reminderText, withAttendance, type Action } from "./notify";
+import {
+  clientReminderText,
+  planClientReminders,
+  planNotifications,
+  reminderText,
+  withAttendance,
+  withClientConfirm,
+  type Action,
+} from "./notify";
 import { readSnapshot, updateNotes } from "./sheet";
-import { audit, getBinding } from "./store";
+import { audit, getBinding, getClientBooking, listActiveClientBookingOwners } from "./store";
 import { formatHHMM, nowAbs, serialToDate, zonedNow } from "./time";
 import { dayView, toEntries } from "./views";
 
@@ -49,12 +57,13 @@ export async function runReminders(d: Deps): Promise<RunResult> {
     .prepare("SELECT key FROM sent_reminders WHERE created_at > datetime('now', ?1)")
     .bind(`-${KEEP_DAYS} days`)
     .all<{ key: string }>();
+  const sentSet = new Set(results.map((r) => r.key));
   const actions = planNotifications({
     entries,
     schedule: snap.settings.schedule,
     firstHour: snap.settings.firstHour,
     now,
-    sent: new Set(results.map((r) => r.key)),
+    sent: sentSet,
   });
 
   let sent = 0;
@@ -91,9 +100,47 @@ export async function runReminders(d: Deps): Promise<RunResult> {
       failed++;
     }
   }
+
+  // Особисті нагадування клієнтам у ЛС за 30 хв до початку.
+  const botIds = [...new Set(entries.map((e) => e.id).filter(Boolean))];
+  const clientOwners = await listActiveClientBookingOwners(d.db, botIds);
+  const clientActions = planClientReminders({ entries, clientOwners, now, sent: sentSet });
+  for (const ca of clientActions) {
+    const text = clientReminderText(ca, snap.settings.pcList);
+    const res = await d.db
+      .prepare("INSERT OR IGNORE INTO sent_reminders (key, kind, booking_id, text) VALUES (?1, 'reminder', ?2, ?3)")
+      .bind(ca.key, ca.entry.id, text)
+      .run();
+    if ((res.meta.changes ?? 0) !== 1) continue;
+    try {
+      const msg = await d.api.sendMessage(ca.clientTgId, text, {
+        parse_mode: "HTML",
+        link_preview_options: { is_disabled: true },
+        reply_markup: clientReminderKeyboard(ca.entry.id),
+      });
+      await d.db.prepare("UPDATE sent_reminders SET chat_id = ?2, message_id = ?3 WHERE key = ?1").bind(ca.key, ca.clientTgId, msg.message_id).run();
+      sent++;
+    } catch (err) {
+      console.error("Клієнтське нагадування не надіслано", ca.key, err);
+      if (!String(err).includes("403")) {
+        await d.db.prepare("DELETE FROM sent_reminders WHERE key = ?1").bind(ca.key).run();
+      }
+      failed++;
+    }
+  }
+
   await d.db.prepare("DELETE FROM sent_reminders WHERE created_at < datetime('now', ?1)").bind(`-${KEEP_DAYS} days`).run();
   return { sent, failed };
 }
+
+export const clientReminderKeyboard = (bookingId: string) => ({
+  inline_keyboard: [
+    [
+      { text: "👍 Буду вчасно", callback_data: `c:rem:ok:${bookingId}` },
+      { text: "❌ Скасувати бронь", callback_data: `c:rem:can:${bookingId}` },
+    ],
+  ],
+});
 
 interface ReminderRow {
   id: number;
@@ -161,5 +208,66 @@ export async function onAttendance(
     action: error ? "attendance_error" : q.came ? "came" : "no_show",
     card_id: r.booking_id,
     details: error ?? { rows },
+  });
+}
+
+/** Кнопка клієнта [👍 Буду вчасно] у ЛС: дописати в колонку H «клієнт підтвердив (HH:MM)». */
+export async function onClientReminderConfirm(
+  d: Deps,
+  bookingId: string,
+  q: { chat_id: number; message_id: number },
+  who: Who,
+  answer: (r: { toast?: string; alert?: boolean }) => Promise<void>,
+): Promise<void> {
+  const owner = await getClientBooking(d.db, bookingId);
+  if (!owner || owner.client_tg_id !== who.id || owner.status !== "active") {
+    await answer({ toast: "Бронь не знайдено або вже скасовано" });
+    return;
+  }
+  await answer({ toast: "Підтверджую…" });
+
+  const z = zonedNow(d.env.TZ || "Europe/Warsaw", d.now ? d.now() : new Date());
+  const at = formatHHMM(z.minutes);
+
+  let rows: number[] = [];
+  let error: string | null = null;
+  try {
+    rows = await updateNotes(
+      d.sheet,
+      (bookings) => bookings.filter((b) => b.botId === bookingId),
+      (note) => withClientConfirm(note, at),
+    );
+    if (!rows.length) error = "Броні в таблиці вже немає.";
+  } catch (err) {
+    error = `Не вдалося оновити: ${err instanceof Error ? err.message : String(err)}`;
+  }
+
+  const savedRow = await d.db
+    .prepare("SELECT text FROM sent_reminders WHERE chat_id = ?1 AND message_id = ?2")
+    .bind(q.chat_id, q.message_id)
+    .first<{ text: string | null }>();
+  const baseText = savedRow?.text ?? "⏰ Нагадування про вашу бронь";
+
+  const statusLine = error ? `❗ ${esc(error)}` : `👍 Підтверджено о ${at}! Чекаємо на вас.`;
+  const markup = error
+    ? { inline_keyboard: [] }
+    : { inline_keyboard: [[{ text: "❌ Скасувати бронь", callback_data: `c:rem:can:${bookingId}` }]] };
+
+  await d.api
+    .editMessageText(q.chat_id, q.message_id, `${baseText}\n\n${statusLine}`, {
+      parse_mode: "HTML",
+      reply_markup: markup,
+      link_preview_options: { is_disabled: true },
+    })
+    .catch((err) => {
+      if (!String(err).includes("message is not modified")) throw err;
+    });
+
+  await audit(d.db, {
+    user_id: who.id,
+    user_name: who.name,
+    action: error ? "attendance_error" : "client_confirm",
+    card_id: bookingId,
+    details: error ?? { rows, at },
   });
 }

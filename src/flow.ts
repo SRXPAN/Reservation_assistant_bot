@@ -787,6 +787,9 @@ const ACTION_LABELS: Record<string, string> = {
   came: "✅ відмітив «прийшов»",
   no_show: "❌ відмітив «не прийшов»",
   attendance_error: "❗ відмітка не записана",
+  client_book: "🎮 клієнт забронював",
+  client_cancel: "🗑 клієнт скасував",
+  client_confirm: "👍 клієнт підтвердив",
 };
 
 /** Останні дії (для /log власника). */

@@ -1,7 +1,7 @@
 // Броні з аркуша «Бронювання»: розбір рядків, групи ПК, накладки і статус «як рахує таблиця».
 // Модуль без мережі й Telegram — його перевіряють тести.
 
-import { isWithinHours, type DaySchedule } from "./hours";
+import { coveredUntil, isWithinHours, openWindowAt, windowOf, type DaySchedule } from "./hours";
 import { MIN_PER_DAY } from "./time";
 
 /** Перший рядок даних і останній рядок, до якого протягнуті формули I–T. */
@@ -224,4 +224,188 @@ export function newBookingId(now: number = Date.now()): string {
   const rnd = crypto.getRandomValues(new Uint8Array(3));
   const hex = Array.from(rnd, (x) => x.toString(16).padStart(2, "0")).join("");
   return `R-${now.toString(36)}-${hex}`;
+}
+
+/* ───────────── клієнтський підбір слотів і суміжних ПК ───────────── */
+
+/** Унікальні непорожні назви зон у порядку появи в `pcList`. */
+export function availableZones(pcList: number[], zones: Record<number, string>): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const pc of pcList) {
+    const z = (zones[pc] ?? "").trim();
+    if (z && !seen.has(z)) {
+      seen.add(z);
+      out.push(z);
+    }
+  }
+  return out;
+}
+
+/** Відсортовані унікальні номери ПК конкретної зони. */
+export function zonePCs(pcList: number[], zones: Record<number, string>, zone: string): number[] {
+  return [...new Set(pcList.filter((pc) => (zones[pc] ?? "").trim() === zone))].sort((a, b) => a - b);
+}
+
+/** Перетворити абсолютний інтервал [startAbs, endAbs) у (date, from, to) для таблиці. */
+export function intervalToBookingTime(startAbs: number, endAbs: number): { date: number; from: number; to: number } {
+  const date = Math.floor(startAbs / MIN_PER_DAY);
+  const from = startAbs - date * MIN_PER_DAY;
+  const to = endAbs % MIN_PER_DAY;
+  return { date, from, to };
+}
+
+function toCompleteList(bookings: readonly (SheetBooking | CompleteBooking)[]): CompleteBooking[] {
+  const out: CompleteBooking[] = [];
+  for (const b of bookings) {
+    if ("lo" in b && "hi" in b && "start" in b && "end" in b) out.push(b);
+    else {
+      const c = complete(b);
+      if (c) out.push(c);
+    }
+  }
+  return out;
+}
+
+export interface AllocateOpts {
+  zonePcs: number[];
+  count: number;
+  start: number;
+  end: number;
+  bookings: readonly (SheetBooking | CompleteBooking)[];
+  preferredPcs?: number[];
+  strictContiguous?: boolean;
+}
+
+/**
+ * Підібрати вільні ПК у зоні на інтервал [start, end).
+ * За замовчуванням обирає суміжний блок за принципом best-fit (найменший придатний відрізок),
+ * щоб не дробити великі суміжні групи.
+ */
+export function allocateContiguousPCs(opts: AllocateOpts): number[] | null {
+  const { zonePcs, count, start, end, bookings, preferredPcs, strictContiguous } = opts;
+  const sortedZone = [...new Set(zonePcs)].sort((a, b) => a - b);
+  const overlapping = toCompleteList(bookings).filter((b) => intervalsOverlap({ start, end }, b));
+  const freePcs = sortedZone.filter((pc) => !overlapping.some((b) => pc >= b.lo && pc <= b.hi));
+
+  if (preferredPcs?.length) {
+    const uniq = [...new Set(preferredPcs)].sort((a, b) => a - b);
+    if (uniq.length !== count) return null;
+    const freeSet = new Set(freePcs);
+    return uniq.every((pc) => freeSet.has(pc)) ? uniq : null;
+  }
+
+  if (count <= 0 || freePcs.length < count) return null;
+
+  // Розбиваємо на фізично суміжні серії (pc[i] === pc[i-1] + 1).
+  const runs: number[][] = [];
+  for (const pc of freePcs) {
+    const prev = runs.at(-1);
+    if (prev && prev.at(-1)! + 1 === pc) prev.push(pc);
+    else runs.push([pc]);
+  }
+
+  let bestRun: number[] | null = null;
+  for (const run of runs) {
+    if (run.length < count) continue;
+    if (!bestRun || run.length < bestRun.length || (run.length === bestRun.length && run[0]! < bestRun[0]!)) {
+      bestRun = run;
+    }
+  }
+  if (bestRun) return bestRun.slice(0, count);
+  if (strictContiguous) return null;
+
+  // Fallback: вікно з `count` вільних ПК із мінімальним розмахом номерів.
+  let bestStart = 0;
+  let bestSpan = Infinity;
+  for (let i = 0; i <= freePcs.length - count; i++) {
+    const span = freePcs[i + count - 1]! - freePcs[i]!;
+    if (span < bestSpan) {
+      bestSpan = span;
+      bestStart = i;
+    }
+  }
+  return freePcs.slice(bestStart, bestStart + count);
+}
+
+export interface StartTimesOpts {
+  daySerial: number;
+  schedule: DaySchedule[];
+  zonePcs: number[];
+  count: number;
+  bookings: SheetBooking[];
+  nowAbs: number;
+  stepMinutes?: number;
+  minDurationMinutes?: number;
+  preferredPcs?: number[];
+}
+
+/** Доступні часи початку (у хвилинах від епохи) для обраного дня, зони та кількості ПК. */
+export function findAvailableStartTimes(opts: StartTimesOpts): number[] {
+  const { daySerial, schedule, zonePcs, count, bookings, nowAbs, stepMinutes = 60, minDurationMinutes = 60, preferredPcs } = opts;
+  const w = windowOf(schedule, daySerial);
+  if (w.end <= w.start) return [];
+
+  const relevant = toCompleteList(bookings).filter((b) => b.end > w.start && b.start < w.end + minDurationMinutes);
+  const out: number[] = [];
+  for (let t = w.start; t < w.end; t += stepMinutes) {
+    if (t < nowAbs) continue;
+    if (coveredUntil(schedule, Math.floor(t / MIN_PER_DAY), t) < t + minDurationMinutes) continue;
+    if (allocateContiguousPCs({ zonePcs, count, start: t, end: t + minDurationMinutes, bookings: relevant, preferredPcs })) {
+      out.push(t);
+    }
+  }
+  return out;
+}
+
+export interface DurationOption {
+  minutes: number;
+  endAbs: number;
+  toClose: boolean;
+  pcs: number[];
+}
+
+export interface DurationsOpts {
+  startAbs: number;
+  schedule: DaySchedule[];
+  zonePcs: number[];
+  count: number;
+  bookings: SheetBooking[];
+  preferredPcs?: number[];
+  standardHours?: number[];
+}
+
+/** Доступні тривалості від `startAbs` з урахуванням закриття клубу та наступних броней. */
+export function findAvailableDurations(opts: DurationsOpts): DurationOption[] {
+  const { startAbs, schedule, zonePcs, count, bookings, preferredPcs, standardHours = [1, 2, 3, 4, 5] } = opts;
+  const openWin = openWindowAt(schedule, startAbs);
+  if (!openWin) return [];
+
+  const maxCovered = coveredUntil(schedule, Math.floor(startAbs / MIN_PER_DAY), startAbs);
+  const relevant = toCompleteList(bookings).filter((b) => b.end > startAbs && b.start < maxCovered);
+  const options: DurationOption[] = [];
+
+  for (const h of standardHours) {
+    const minutes = h * 60;
+    const endAbs = startAbs + minutes;
+    if (minutes > MIN_PER_DAY || endAbs > maxCovered) continue;
+    const pcs = allocateContiguousPCs({ zonePcs, count, start: startAbs, end: endAbs, bookings: relevant, preferredPcs });
+    if (pcs) options.push({ minutes, endAbs, toClose: false, pcs });
+  }
+
+  // «До закриття»: якщо зміна не цілодобова або наступний день зачинений.
+  if (openWin.end - openWin.start < MIN_PER_DAY || maxCovered === openWin.end) {
+    const closeAbs = openWin.end;
+    const toCloseMin = closeAbs - startAbs;
+    if (toCloseMin >= 60 && toCloseMin <= MIN_PER_DAY) {
+      const existing = options.find((o) => o.minutes === toCloseMin);
+      if (existing) existing.toClose = true;
+      else {
+        const pcs = allocateContiguousPCs({ zonePcs, count, start: startAbs, end: closeAbs, bookings: relevant, preferredPcs });
+        if (pcs) options.push({ minutes: toCloseMin, endAbs: closeAbs, toClose: true, pcs });
+      }
+    }
+  }
+
+  return options.sort((a, b) => a.minutes - b.minutes);
 }
