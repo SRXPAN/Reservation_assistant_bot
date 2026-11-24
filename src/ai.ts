@@ -2,6 +2,7 @@
 // Відповідь моделі — строго JSON за схемою; кожне поле перевіряємо, сумнівне відкидаємо.
 
 import { cacheGet, cachePut } from "./db";
+import { safeError } from "./log";
 import type { Draft } from "./parse";
 import { WEEKDAY_SHORT } from "./parse";
 import { dateToSerial, formatDate, isValidDate, parseHHMM, weekdayIndex } from "./time";
@@ -111,7 +112,7 @@ export async function aiParse(
     const res = (await Promise.race([run, timeout])) as { response?: unknown } | null;
     return res ? validateAiAnswer(res.response, today, pcList) : null;
   } catch (err) {
-    console.error("Workers AI: помилка", err);
+    console.error("Workers AI: помилка", safeError(err));
     return null;
   }
 }

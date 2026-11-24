@@ -1,14 +1,15 @@
-// Підключення логіки до grammY: прив'язка гілки, фільтр «лише своя гілка», меню, маршрутизація.
+// Підключення логіки до grammY: ізоляція DM клієнтів, закритий адмін-канал, єдина перевірка isAdmin.
 
 import { Bot, type Context } from "grammy";
 import type { Message, UserFromGetMe } from "grammy/types";
 import type { AiBinding } from "./ai";
 import { menuKeyboard } from "./card";
 import { onClientCallback, onClientContact, onClientStart, onClientText, type ClientUser } from "./client_flow";
-import { getConfig, sheetUrl, type Env } from "./config";
+import { getBotUsername, getConfig, isAdmin, sheetUrl, type Env } from "./config";
 import { auditText, onBookingText, onCallback, onMenu, onPromptReply, type Deps, type Who } from "./flow";
+import { safeError } from "./log";
 import { onAttendance } from "./reminders";
-import { audit, getBinding, setBinding, type Binding } from "./store";
+import { audit, getBinding, getClientSession, setBinding, type Binding } from "./store";
 
 export interface BotOptions {
   /** До якого моменту (мс) треба закінчити обробку. */
@@ -69,6 +70,25 @@ export function createBot(env: Env, opts: BotOptions): Bot {
   const isOwner = (ctx: Context) => ctx.from?.id === config.ownerId;
   const menuMarkup = menuKeyboard(sheetUrl(env.SHEET_ID));
 
+  /** Перенаправлення з публічної групи в приватні повідомлення бота без розкриття жодних броней. */
+  async function replyDmRedirect(ctx: Context, thread: number | null) {
+    const username = getBotUsername(env, ctx.me?.username);
+    const text = "🔒 Бронювання ПК та перегляд вільних місць доступні лише в особистих повідомленнях бота.";
+    const reply_markup = username
+      ? { inline_keyboard: [[{ text: "💬 Перейти в особисті повідомлення", url: `https://t.me/${username}?start=book` }]] }
+      : undefined;
+    await ctx.reply(text, {
+      message_thread_id: thread ?? undefined,
+      reply_markup,
+    });
+  }
+
+  function mentionsBot(text: string, ctx: Context): boolean {
+    const username = getBotUsername(env, ctx.me?.username);
+    if (!username) return false;
+    return text.toLowerCase().includes(`@${username.toLowerCase()}`);
+  }
+
   /** Показати меню: оновити вже закріплене, а якщо його немає — надіслати нове і закріпити. */
   async function showMenu(chatId: number, thread: number | null, binding: Binding) {
     if (binding.menu_message_id) {
@@ -88,32 +108,33 @@ export function createBot(env: Env, opts: BotOptions): Bot {
       link_preview_options: { is_disabled: true },
     });
     await bot.api.pinChatMessage(chatId, menu.message_id, { disable_notification: true }).catch((err) => {
-      console.warn("Не вдалося закріпити меню (потрібне право «Закріплювати повідомлення»)", err);
+      console.warn("Не вдалося закріпити меню (потрібне право «Закріплювати повідомлення»)", safeError(err));
     });
     await setBinding(env.DB, { ...binding, menu_message_id: menu.message_id });
   }
 
-  // /start: у ЛС — клієнтське меню; у групі — прив'язка гілки (лише власник) або оновлення адмін-меню.
+  // /start: у ЛС — клієнтське меню; у групі — прив'язка гілки (лише власник) або редирект у DM.
   bot.command("start", async (ctx) => {
     const chat = ctx.chat;
     if (chat.type === "private") {
       if (ctx.from?.is_bot) return;
-      await onClientStart(deps, clientUser(ctx));
+      await onClientStart(deps, clientUser(ctx), chat.type);
       return;
     }
     const thread = threadOf(ctx.msg);
+    const binding = await getBinding(env.DB);
     if (!isOwner(ctx)) {
-      // Пояснюємо, а не мовчимо: найчастіша причина — власник пише анонімно від імені групи.
       const anonymous = ctx.from?.id === ANONYMOUS_ADMIN || ctx.msg.sender_chat?.id === chat.id;
-      await ctx.reply(
-        anonymous
-          ? "Ви пишете анонімно (від імені групи), тож я не можу перевірити, що це власник. Вимкніть «Залишатися анонімним» у своїх правах адміністратора або напишіть /start з особистого акаунта власника."
-          : "Прив'язати гілку для бронювань може лише власник бота.",
-        { message_thread_id: thread ?? undefined },
-      );
+      if (!binding && anonymous) {
+        await ctx.reply(
+          "Ви пишете анонімно (від імені групи), тож я не можу перевірити, що це власник. Вимкніть «Залишатися анонімним» у своїх правах адміністратора або напишіть /start з особистого акаунта власника.",
+          { message_thread_id: thread ?? undefined },
+        );
+        return;
+      }
+      await replyDmRedirect(ctx, thread);
       return;
     }
-    const binding = await getBinding(env.DB);
     if (inBinding(binding, chat.id, thread)) {
       await showMenu(chat.id, thread, binding!);
       return;
@@ -124,11 +145,43 @@ export function createBot(env: Env, opts: BotOptions): Bot {
     });
   });
 
-  // /log: останні дії (лише власник; у прив'язаній гілці або в особистих).
-  bot.command("log", async (ctx) => {
-    if (!isOwner(ctx)) return;
-    const binding = await getBinding(env.DB);
+  // /admin: повне адмін-меню в DM або в прив'язаній адмін-гілці (лише для isAdmin).
+  bot.command("admin", async (ctx) => {
     const thread = threadOf(ctx.msg);
+    if (!isAdmin(ctx.from?.id, env)) {
+      if (ctx.chat.type === "private") {
+        await ctx.reply("⛔ Команда доступна лише адміністраторам.");
+      } else {
+        await replyDmRedirect(ctx, thread);
+      }
+      return;
+    }
+    if (ctx.chat.type === "private") {
+      await ctx.reply(MENU_TEXT, {
+        parse_mode: "HTML",
+        reply_markup: menuMarkup,
+        link_preview_options: { is_disabled: true },
+      });
+      return;
+    }
+    const binding = await getBinding(env.DB);
+    if (inBinding(binding, ctx.chat.id, thread)) {
+      await showMenu(ctx.chat.id, thread, binding!);
+    } else {
+      await replyDmRedirect(ctx, thread);
+    }
+  });
+
+  // /log: останні дії (лише адміністратор; у прив'язаній гілці або в особистих).
+  bot.command("log", async (ctx) => {
+    const thread = threadOf(ctx.msg);
+    if (!isAdmin(ctx.from?.id, env)) {
+      if (ctx.chat.type === "private") {
+        await ctx.reply("⛔ Команда доступна лише адміністраторам.");
+      }
+      return;
+    }
+    const binding = await getBinding(env.DB);
     if (ctx.chat.type !== "private" && !inBinding(binding, ctx.chat.id, thread)) return;
     await ctx.reply(await auditText(deps), { parse_mode: "HTML", message_thread_id: thread ?? undefined });
   });
@@ -154,7 +207,7 @@ export function createBot(env: Env, opts: BotOptions): Bot {
     await audit(env.DB, { user_id: ctx.from.id, user_name: who(ctx).name, action: "bind", details: binding });
   });
 
-  // Кнопки: у ЛС (c:*) — клієнтський режим; у групі — лише прив'язана гілка.
+  // Кнопки: у ЛС (c:*) — клієнтський режим; адмінські кнопки (m:*, a:*, картки) — тільки для isAdmin у DM або прив'язаному адмін-чаті.
   bot.on("callback_query:data", async (ctx) => {
     const msg = ctx.callbackQuery.message;
     const data = ctx.callbackQuery.data;
@@ -165,18 +218,35 @@ export function createBot(env: Env, opts: BotOptions): Bot {
       await ctx.answerCallbackQuery({ text: r.toast, show_alert: r.alert }).catch(() => {});
     };
 
-    if (msg?.chat.type === "private" && data.startsWith("c:")) {
-      await onClientCallback(deps, { data, chat_id: msg.chat.id, message_id: msg.message_id }, clientUser(ctx), answer);
+    if (!msg) {
+      await answer({});
+      return;
+    }
+
+    if (data.startsWith("c:")) {
+      if (msg.chat.type !== "private") {
+        await answer({ toast: "Доступно лише в особистих повідомленнях." });
+        return;
+      }
+      await onClientCallback(deps, { data, chat_id: msg.chat.id, message_id: msg.message_id, chat_type: msg.chat.type }, clientUser(ctx), answer);
       if (!answered) await ctx.answerCallbackQuery().catch(() => {});
       return;
     }
 
-    const binding = await getBinding(env.DB);
-    const thread = msg ? threadOf(msg as Message) : null;
-    if (!msg || !inBinding(binding, msg.chat.id, thread)) {
-      await ctx.answerCallbackQuery();
+    const thread = threadOf(msg as Message);
+    if (msg.chat.type !== "private") {
+      const binding = await getBinding(env.DB);
+      if (!inBinding(binding, msg.chat.id, thread)) {
+        await answer({ toast: "Недоступно в цьому чаті." });
+        return;
+      }
+    }
+
+    if (!isAdmin(ctx.from?.id, env)) {
+      await answer({ toast: "Немає доступу." });
       return;
     }
+
     if (data.startsWith("m:")) await onMenu(deps, data.slice(2), { chat_id: msg.chat.id, thread_id: thread }, who(ctx), answer);
     else if (data.startsWith("a:")) {
       const [act, id] = data.slice(2).split("|");
@@ -185,28 +255,62 @@ export function createBot(env: Env, opts: BotOptions): Bot {
     if (!answered) await ctx.answerCallbackQuery().catch(() => {});
   });
 
-  // Контакт (номер телефону) у ЛС клієнта.
+  // Контакт (номер телефону) дозволено виключно у ЛС клієнта.
   bot.on("message:contact", async (ctx) => {
     if (ctx.chat.type !== "private" || ctx.from?.is_bot) return;
     await onClientContact(
       deps,
-      { chat_id: ctx.chat.id, message_id: ctx.msg.message_id, phone_number: ctx.msg.contact.phone_number },
+      { chat_id: ctx.chat.id, message_id: ctx.msg.message_id, phone_number: ctx.msg.contact.phone_number, chat_type: ctx.chat.type },
       clientUser(ctx),
     );
   });
 
-  // Текст: у ЛС — лише кроки клієнтського майстра (без адмін-парсера); у групі — прив'язана гілка.
+  // Текст: у ЛС — клієнтський майстер (і адмін-парсер для isAdmin); у публічних групах — редирект у DM.
   bot.on("message:text", async (ctx) => {
     if (ctx.from.is_bot) return;
     const text = ctx.msg.text;
+
     if (ctx.chat.type === "private") {
       if (text.startsWith("/")) return;
-      await onClientText(deps, { chat_id: ctx.chat.id, message_id: ctx.msg.message_id, text }, clientUser(ctx));
+      if (isAdmin(ctx.from.id, env)) {
+        const reply = ctx.msg.reply_to_message;
+        if (reply && reply.from?.id === ctx.me.id) {
+          const handled = await onPromptReply(
+            deps,
+            { chat_id: ctx.chat.id, thread_id: null, message_id: ctx.msg.message_id, reply_to: reply.message_id, text },
+            who(ctx),
+          );
+          if (handled) return;
+        }
+        const session = await getClientSession(env.DB, ctx.from.id);
+        if (session && ["name_input", "phone_input"].includes(session.step)) {
+          await onClientText(deps, { chat_id: ctx.chat.id, message_id: ctx.msg.message_id, text, chat_type: ctx.chat.type }, clientUser(ctx));
+          return;
+        }
+        if (await onBookingText(deps, { chat_id: ctx.chat.id, thread_id: null, message_id: ctx.msg.message_id, text }, who(ctx))) {
+          return;
+        }
+      }
+      await onClientText(deps, { chat_id: ctx.chat.id, message_id: ctx.msg.message_id, text, chat_type: ctx.chat.type }, clientUser(ctx));
       return;
     }
+
     const binding = await getBinding(env.DB);
     const thread = threadOf(ctx.msg);
-    if (!inBinding(binding, ctx.chat.id, thread)) return;
+    if (!inBinding(binding, ctx.chat.id, thread)) {
+      if (text.startsWith("/") || mentionsBot(text, ctx)) {
+        await replyDmRedirect(ctx, thread);
+      }
+      return;
+    }
+
+    if (!isAdmin(ctx.from.id, env)) {
+      if (text.startsWith("/") || mentionsBot(text, ctx)) {
+        await replyDmRedirect(ctx, thread);
+      }
+      return;
+    }
+
     const reply = ctx.msg.reply_to_message;
     if (reply && reply.from?.id === ctx.me.id) {
       const handled = await onPromptReply(
@@ -221,7 +325,7 @@ export function createBot(env: Env, opts: BotOptions): Bot {
   });
 
   bot.catch((err) => {
-    console.error("Помилка в обробнику", err.error);
+    console.error("Помилка в обробнику", safeError(err));
   });
 
   return bot;

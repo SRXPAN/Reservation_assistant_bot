@@ -1,6 +1,6 @@
 // Логіка клієнтського самозапису в особистих повідомленнях (`chat.type === 'private'`).
 // Покроковий інлайн-майстер у одному повідомленні, «Мої броні», антиспам-ліміт (макс. 2 активні броні),
-// повторна перевірка свіжої таблиці під замком D1 перед записом і сповіщення адмінів.
+// ізоляція даних через `PublicSlotSummary`, захист від IDOR і сповіщення виключно у закритий адмін-канал.
 
 import {
   allocateContiguousPCs,
@@ -11,6 +11,7 @@ import {
   newBookingId,
   zonePCs,
   type NewBooking,
+  type PublicSlotSummary,
 } from "./bookings";
 import {
   adminClientCancelledText,
@@ -36,6 +37,7 @@ import {
 } from "./card";
 import type { CallbackResult, Deps } from "./flow";
 import { windowOf } from "./hours";
+import { safeError } from "./log";
 import { clientReminderKeyboard, onClientReminderConfirm } from "./reminders";
 import {
   BookingConflictError,
@@ -44,28 +46,29 @@ import {
   clearBooking,
   loadSettings,
   placeClientBooking,
-  readSnapshot,
+  readAuthorizedClientBooking,
+  readClientOwnBookings,
+  readPublicSnapshot,
   type Settings,
-  type Snapshot,
 } from "./sheet";
 import {
   audit,
   clearClientSession,
-  getBinding,
-  getClientBooking,
+  getAdminChannel,
+  getAuthorizedClientBooking,
   getClientSession,
-  listClientBookings,
   markClientBookingCancelled,
   saveClientBooking,
   saveClientSession,
   transitionClientSession,
 } from "./store";
 import { MIN_PER_DAY, formatDate, formatHHMM, nowAbs, zonedNow } from "./time";
-import { businessDay, toEntries, type Entry } from "./views";
+import { businessDay, publicAvailabilityView } from "./views";
 
 export const MAX_CLIENT_BOOKINGS = 2;
 export const MAX_CLIENT_PCS = 5;
 export const CLIENT_NOTE = "клієнт через бот";
+export const NEUTRAL_BOOKING_ERROR = "Бронь недоступна.";
 
 export interface ClientUser {
   id: number;
@@ -90,6 +93,11 @@ interface ClientWizardData {
   contact?: string;
   phonePromptMsgId?: number;
   editing?: boolean;
+}
+
+interface PublicSnapshot {
+  busySlots: PublicSlotSummary[];
+  settings: Settings;
 }
 
 const now = (d: Deps) => (d.now ? d.now() : new Date());
@@ -120,25 +128,15 @@ async function cleanupPhonePrompt(d: Deps, chatId: number, data: ClientWizardDat
 }
 
 async function notifyAdmins(d: Deps, text: string) {
-  const binding = await getBinding(d.db);
-  if (!binding) return;
+  const channel = await getAdminChannel(d.db, d.env);
+  if (!channel) return;
   await d.api
-    .sendMessage(binding.chat_id, text, {
+    .sendMessage(channel.chat_id, text, {
       parse_mode: "HTML",
-      message_thread_id: binding.thread_id ?? undefined,
+      message_thread_id: channel.thread_id ?? undefined,
       link_preview_options: { is_disabled: true },
     })
-    .catch((err) => console.error("Сповіщення адміну", err));
-}
-
-async function activeClientEntries(d: Deps, userId: number, preSnap?: Snapshot): Promise<{ entries: Entry[]; snap: Snapshot | null }> {
-  const mine = await listClientBookings(d.db, userId);
-  if (!mine.length) return { entries: [], snap: preSnap ?? null };
-  const activeIds = new Set(mine.map((r) => r.booking_id));
-  const snap = preSnap ?? (await readSnapshot(d.sheet));
-  const at = nowMin(d);
-  const entries = toEntries(snap.bookings, snap.settings.pcList).filter((e) => e.id && activeIds.has(e.id) && e.end > at);
-  return { entries, snap };
+    .catch((err) => console.error("Сповіщення адміну", safeError(err)));
 }
 
 function headerSummary(data: ClientWizardData, pcList: number[]): string {
@@ -158,7 +156,7 @@ function headerSummary(data: ClientWizardData, pcList: number[]): string {
   return lines.join("\n");
 }
 
-/* ───────────── відображення кроків майстра ───────────── */
+/* ───────────── відображення кроків майстра (виключно PublicSlotSummary) ───────────── */
 
 async function showDateStep(d: Deps, chatId: number, msgId: number, userId: number, data: ClientWizardData, settings: Settings) {
   const at = nowMin(d);
@@ -220,23 +218,23 @@ async function showTimeStep(
   msgId: number,
   userId: number,
   data: ClientWizardData,
-  snap: Snapshot,
+  pub: PublicSnapshot,
   customNotice?: string,
 ) {
-  const zPcs = zonePCs(snap.settings.pcList, snap.settings.zones, data.zone!);
+  const zPcs = zonePCs(pub.settings.pcList, pub.settings.zones, data.zone!);
   const slots = findAvailableStartTimes({
     daySerial: data.daySerial!,
-    schedule: snap.settings.schedule,
+    schedule: pub.settings.schedule,
     zonePcs: zPcs,
     count: data.count!,
-    bookings: snap.bookings,
+    bookings: pub.busySlots,
     nowAbs: nowMin(d),
     stepMinutes: 60,
     minDurationMinutes: 60,
     preferredPcs: data.preferredPcs,
   });
   await saveClientSession(d.db, { user_id: userId, message_id: msgId, step: "time", data });
-  const head = headerSummary({ ...data, startAbs: undefined, durationMin: undefined }, snap.settings.pcList);
+  const head = headerSummary({ ...data, startAbs: undefined, durationMin: undefined }, pub.settings.pcList);
   if (!slots.length) {
     await editWizard(
       d,
@@ -258,18 +256,18 @@ async function showTimeStep(
   await editWizard(d, chatId, msgId, `${head}\n\n${prompt}`, clientTimeKeyboard(slots, data.daySerial!));
 }
 
-async function showDurationStep(d: Deps, chatId: number, msgId: number, userId: number, data: ClientWizardData, snap: Snapshot) {
-  const zPcs = zonePCs(snap.settings.pcList, snap.settings.zones, data.zone!);
+async function showDurationStep(d: Deps, chatId: number, msgId: number, userId: number, data: ClientWizardData, pub: PublicSnapshot) {
+  const zPcs = zonePCs(pub.settings.pcList, pub.settings.zones, data.zone!);
   const options = findAvailableDurations({
     startAbs: data.startAbs!,
-    schedule: snap.settings.schedule,
+    schedule: pub.settings.schedule,
     zonePcs: zPcs,
     count: data.count!,
-    bookings: snap.bookings,
+    bookings: pub.busySlots,
     preferredPcs: data.preferredPcs,
   });
   await saveClientSession(d.db, { user_id: userId, message_id: msgId, step: "duration", data });
-  const head = headerSummary({ ...data, durationMin: undefined }, snap.settings.pcList);
+  const head = headerSummary({ ...data, durationMin: undefined }, pub.settings.pcList);
   if (!options.length) {
     await editWizard(d, chatId, msgId, `${head}\n\n⚠️ На цей час уже немає доступних слотів. Оберіть інший час початку.`, {
       inline_keyboard: [
@@ -368,11 +366,11 @@ async function showConfirmStep(d: Deps, chatId: number, msgId: number, userId: n
   );
 }
 
-/* ───────────── «Мої броні» та скасування ───────────── */
+/* ───────────── «Мої броні» та захист від IDOR ───────────── */
 
 async function showMyBookings(d: Deps, chatId: number, msgId: number, userId: number) {
-  const { entries, snap } = await activeClientEntries(d, userId);
-  if (!entries.length) {
+  const { bookings, settings } = await readClientOwnBookings(d.sheet, d.db, userId, nowMin(d));
+  if (!bookings.length) {
     await editWizard(
       d,
       chatId,
@@ -388,26 +386,21 @@ async function showMyBookings(d: Deps, chatId: number, msgId: number, userId: nu
     return;
   }
 
-  const pcList = snap!.settings.pcList;
-  const zones = snap!.settings.zones;
-  const blocks = entries.map((e, i) => {
-    const z = [...new Set(e.pcs.map((pc) => zones[pc]).filter(Boolean))].join(" + ");
-    const endStr = e.end % MIN_PER_DAY === 0 ? "24:00" : formatHHMM(e.end);
-    return `${i + 1}. 📅 <b>${formatDate(e.date)}</b> · ${formatHHMM(e.start)}–${endStr}\n   💻 ${pcsLabel(e.pcs, pcList)}${z ? ` (${esc(z)})` : ""} · 👤 ${esc(e.name)}`;
+  const blocks = bookings.map((b, i) => {
+    const endStr = b.end % MIN_PER_DAY === 0 ? "24:00" : formatHHMM(b.end);
+    return `${i + 1}. 📅 <b>${formatDate(b.date)}</b> · ${formatHHMM(b.start)}–${endStr}\n   💻 ${pcsLabel(b.pcs, settings.pcList)}${b.zone ? ` (${esc(b.zone)})` : ""} · 👤 ${esc(b.name)}`;
   });
-  const cancelButtons = entries.map((e) => [
-    {
-      text: `❌ Скасувати (${formatDate(e.date).slice(0, 5)} ${formatHHMM(e.start)})`,
-      callback_data: `c:mycan:${e.id}`,
-    },
+  const actionRows = bookings.map((b) => [
+    { text: `👁 Деталі (${formatDate(b.date).slice(0, 5)} ${formatHHMM(b.start)})`, callback_data: `c:myview:${b.id}` },
+    { text: "❌ Скасувати", callback_data: `c:mycan:${b.id}` },
   ]);
   await editWizard(
     d,
     chatId,
     msgId,
-    `📋 <b>Мої активні броні</b> (${entries.length}/${MAX_CLIENT_BOOKINGS}):\n\n${blocks.join("\n\n")}`,
+    `📋 <b>Мої активні броні</b> (${bookings.length}/${MAX_CLIENT_BOOKINGS}):\n\n${blocks.join("\n\n")}`,
     {
-      inline_keyboard: [...cancelButtons, [{ text: "⬅️ Головне меню", callback_data: "c:menu" }]],
+      inline_keyboard: [...actionRows, [{ text: "⬅️ Головне меню", callback_data: "c:menu" }]],
     },
   );
 }
@@ -420,15 +413,13 @@ async function performClientCancel(
   user: ClientUser,
   answer: Answer,
 ) {
-  const owner = await getClientBooking(d.db, bookingId);
-  if (!owner || owner.client_tg_id !== user.id || owner.status !== "active") {
-    await answer({ toast: "Бронь не знайдено або вже скасовано" });
+  const authorized = await readAuthorizedClientBooking(d.sheet, d.db, bookingId, user.id, d.env);
+  if (!authorized) {
+    await answer({ toast: NEUTRAL_BOOKING_ERROR });
     return;
   }
   await answer({ toast: "Скасовую…" });
 
-  const snap = await readSnapshot(d.sheet);
-  const entry = toEntries(snap.bookings, snap.settings.pcList).find((e) => e.id === bookingId);
   await clearBooking(d.sheet, bookingId);
   await markClientBookingCancelled(d.db, bookingId);
   await audit(d.db, {
@@ -438,9 +429,7 @@ async function performClientCancel(
     card_id: bookingId,
   });
 
-  if (entry) {
-    await notifyAdmins(d, adminClientCancelledText(entry, snap.settings.pcList));
-  }
+  await notifyAdmins(d, adminClientCancelledText(authorized.booking, authorized.settings.pcList));
   await editWizard(d, chatId, msgId, "🗑 <b>Бронь скасовано.</b>", {
     inline_keyboard: [
       [
@@ -451,9 +440,10 @@ async function performClientCancel(
   });
 }
 
-/* ───────────── публічні обробники ───────────── */
+/* ───────────── публічні обробники (тільки chatType === 'private') ───────────── */
 
-export async function onClientStart(d: Deps, user: ClientUser): Promise<void> {
+export async function onClientStart(d: Deps, user: ClientUser, chatType: string = "private"): Promise<void> {
+  if (chatType !== "private") return;
   const existing = await getClientSession(d.db, user.id);
   if (existing) {
     const data = JSON.parse(existing.data) as ClientWizardData;
@@ -469,20 +459,24 @@ export async function onClientStart(d: Deps, user: ClientUser): Promise<void> {
 
 export async function onClientCallback(
   d: Deps,
-  q: { data: string; chat_id: number; message_id: number },
+  q: { data: string; chat_id: number; message_id: number; chat_type?: string },
   user: ClientUser,
   answer: Answer,
 ): Promise<void> {
+  if ((q.chat_type ?? "private") !== "private") {
+    await answer({ toast: "Доступно лише в особистих повідомленнях." });
+    return;
+  }
   try {
     await handleClientCallback(d, q, user, answer);
   } catch (err) {
-    console.error("Помилка клієнтського меню", q.data, err);
+    console.error("Помилка клієнтського меню", q.data.split(":")[1] ?? "unknown", safeError(err));
     await answer({});
     await editWizard(
       d,
       q.chat_id,
       q.message_id,
-      `❗ Сталася помилка (${esc(err instanceof Error ? err.message : String(err))}). Спробуйте ще раз.`,
+      "❗ Тимчасова помилка. Спробуйте ще раз.",
       { inline_keyboard: [[{ text: "⬅️ Головне меню", callback_data: "c:menu" }]] },
     ).catch(() => {});
   }
@@ -496,7 +490,7 @@ async function handleClientCallback(
 ): Promise<void> {
   const dataStr = q.data;
 
-  // Нагадування клієнту за 30 хв
+  // Нагадування клієнту за 30 хв (з обов'язковою перевіркою власника для кожної дії)
   if (dataStr.startsWith("c:rem:")) {
     const rest = dataStr.slice("c:rem:".length);
     const sep = rest.indexOf(":");
@@ -508,10 +502,8 @@ async function handleClientCallback(
       return onClientReminderConfirm(d, bookingId, { chat_id: q.chat_id, message_id: q.message_id }, who, answer);
     }
     if (act === "can") {
-      const owner = await getClientBooking(d.db, bookingId);
-      if (!owner || owner.client_tg_id !== user.id || owner.status !== "active") {
-        return answer({ toast: "Бронь не знайдено або вже скасовано" });
-      }
+      const owner = await getAuthorizedClientBooking(d.db, bookingId, user.id, d.env);
+      if (!owner) return answer({ toast: NEUTRAL_BOOKING_ERROR });
       await answer({});
       await editWizard(d, q.chat_id, q.message_id, "❓ Ви впевнені, що хочете скасувати бронь?", {
         inline_keyboard: [
@@ -522,6 +514,8 @@ async function handleClientCallback(
       return;
     }
     if (act === "back") {
+      const owner = await getAuthorizedClientBooking(d.db, bookingId, user.id, d.env);
+      if (!owner) return answer({ toast: NEUTRAL_BOOKING_ERROR });
       await answer({});
       const row = await d.db
         .prepare("SELECT text FROM sent_reminders WHERE chat_id = ?1 AND message_id = ?2")
@@ -556,8 +550,9 @@ async function handleClientCallback(
 
   if (dataStr === "c:info") {
     await answer({});
-    const settings = await loadSettings(d.sheet);
-    await editWizard(d, q.chat_id, q.message_id, clientInfoText(settings), {
+    const pub = await readPublicSnapshot(d.sheet);
+    const availability = publicAvailabilityView(pub.busySlots, pub.settings, nowMin(d));
+    await editWizard(d, q.chat_id, q.message_id, `${clientInfoText(pub.settings)}\n\n${availability}`, {
       inline_keyboard: [
         [{ text: "🎮 Забронювати ПК", callback_data: "c:book" }],
         [{ text: "⬅️ Головне меню", callback_data: "c:menu" }],
@@ -572,12 +567,36 @@ async function handleClientCallback(
     return;
   }
 
+  if (dataStr.startsWith("c:myview:")) {
+    const bookingId = dataStr.slice("c:myview:".length);
+    const authorized = await readAuthorizedClientBooking(d.sheet, d.db, bookingId, user.id, d.env);
+    if (!authorized) return answer({ toast: NEUTRAL_BOOKING_ERROR });
+    await answer({});
+    const b = authorized.booking;
+    const details = clientConfirmDetails(
+      {
+        startAbs: b.start,
+        durationMin: b.end - b.start,
+        zone: b.zone || "Загальна",
+        pcs: b.pcs,
+        name: b.name,
+        contact: b.contact || "—",
+      },
+      authorized.settings.pcList,
+    );
+    await editWizard(d, q.chat_id, q.message_id, `📌 <b>Деталі бронювання</b>\n\n${details}`, {
+      inline_keyboard: [
+        [{ text: "❌ Скасувати бронь", callback_data: `c:mycan:${b.id}` }],
+        [{ text: "⬅️ Мої броні", callback_data: "c:my" }],
+      ],
+    });
+    return;
+  }
+
   if (dataStr.startsWith("c:mycan:")) {
     const bookingId = dataStr.slice("c:mycan:".length);
-    const owner = await getClientBooking(d.db, bookingId);
-    if (!owner || owner.client_tg_id !== user.id || owner.status !== "active") {
-      return answer({ toast: "Бронь не знайдено або вже скасовано" });
-    }
+    const owner = await getAuthorizedClientBooking(d.db, bookingId, user.id, d.env);
+    if (!owner) return answer({ toast: NEUTRAL_BOOKING_ERROR });
     await answer({});
     await editWizard(d, q.chat_id, q.message_id, "❓ <b>Підтвердіть скасування броні</b>\n\nВи дійсно хочете скасувати цю бронь?", {
       inline_keyboard: [
@@ -601,8 +620,8 @@ async function handleClientCallback(
       await cleanupPhonePrompt(d, q.chat_id, JSON.parse(existing.data) as ClientWizardData);
       await clearClientSession(d.db, user.id);
     }
-    const { entries, snap } = await activeClientEntries(d, user.id);
-    if (entries.length >= MAX_CLIENT_BOOKINGS) {
+    const { bookings, settings } = await readClientOwnBookings(d.sheet, d.db, user.id, nowMin(d));
+    if (bookings.length >= MAX_CLIENT_BOOKINGS) {
       await editWizard(
         d,
         q.chat_id,
@@ -617,7 +636,6 @@ async function handleClientCallback(
       );
       return;
     }
-    const settings = snap ? snap.settings : await loadSettings(d.sheet);
     await showDateStep(d, q.chat_id, q.message_id, user.id, {}, settings);
     return;
   }
@@ -663,12 +681,12 @@ async function handleClientCallback(
         }
         return showCountStep(d, q.chat_id, q.message_id, user.id, { daySerial: data.daySerial, zone: data.zone }, settings);
       case "duration": {
-        const snap = await readSnapshot(d.sheet);
-        return showTimeStep(d, q.chat_id, q.message_id, user.id, data, snap);
+        const pub = await readPublicSnapshot(d.sheet);
+        return showTimeStep(d, q.chat_id, q.message_id, user.id, data, pub);
       }
       case "name": {
-        const snap = await readSnapshot(d.sheet);
-        return showDurationStep(d, q.chat_id, q.message_id, user.id, data, snap);
+        const pub = await readPublicSnapshot(d.sheet);
+        return showDurationStep(d, q.chat_id, q.message_id, user.id, data, pub);
       }
       case "name_input":
         return showNameStep(d, q.chat_id, q.message_id, user, data, settings);
@@ -730,8 +748,8 @@ async function handleClientCallback(
     data.count = count;
     data.preferredPcs = undefined;
     data.pickedPcs = undefined;
-    const snap = await readSnapshot(d.sheet);
-    return showTimeStep(d, q.chat_id, q.message_id, user.id, data, snap);
+    const pub = await readPublicSnapshot(d.sheet);
+    return showTimeStep(d, q.chat_id, q.message_id, user.id, data, pub);
   }
 
   if (dataStr === "c:more") {
@@ -787,8 +805,8 @@ async function handleClientCallback(
     await answer({ toast: "Шукаю вільний час…" });
     data.preferredPcs = picked;
     data.count = picked.length;
-    const snap = await readSnapshot(d.sheet);
-    return showTimeStep(d, q.chat_id, q.message_id, user.id, data, snap);
+    const pub = await readPublicSnapshot(d.sheet);
+    return showTimeStep(d, q.chat_id, q.message_id, user.id, data, pub);
   }
 
   // Крок 3: Час початку
@@ -799,21 +817,21 @@ async function handleClientCallback(
     data.startAbs = startAbs;
     data.durationMin = undefined;
     data.pcs = undefined;
-    const snap = await readSnapshot(d.sheet);
-    return showDurationStep(d, q.chat_id, q.message_id, user.id, data, snap);
+    const pub = await readPublicSnapshot(d.sheet);
+    return showDurationStep(d, q.chat_id, q.message_id, user.id, data, pub);
   }
 
   // Крок 4: Тривалість
   if (dataStr.startsWith("c:dur:")) {
     const minutes = Number(dataStr.slice("c:dur:".length));
-    const snap = await readSnapshot(d.sheet);
-    const zPcs = zonePCs(snap.settings.pcList, snap.settings.zones, data.zone!);
+    const pub = await readPublicSnapshot(d.sheet);
+    const zPcs = zonePCs(pub.settings.pcList, pub.settings.zones, data.zone!);
     const pcs = allocateContiguousPCs({
       zonePcs: zPcs,
       count: data.count!,
       start: data.startAbs!,
       end: data.startAbs! + minutes,
-      bookings: snap.bookings,
+      bookings: pub.busySlots,
       preferredPcs: data.preferredPcs,
     });
     if (!pcs) {
@@ -824,14 +842,14 @@ async function handleClientCallback(
         q.message_id,
         user.id,
         data,
-        snap,
+        pub,
         "⚠️ На обрану тривалість ці ПК щойно зайняли. Оберіть інший час:",
       );
     }
     await answer({});
     data.durationMin = minutes;
     data.pcs = pcs;
-    return showNameStep(d, q.chat_id, q.message_id, user, data, snap.settings);
+    return showNameStep(d, q.chat_id, q.message_id, user, data, pub.settings);
   }
 
   // Крок 5: Ім'я
@@ -914,8 +932,8 @@ async function handleClientCallback(
     }
     if (what === "time") {
       data.editing = false;
-      const snap = await readSnapshot(d.sheet);
-      return showTimeStep(d, q.chat_id, q.message_id, user.id, data, snap);
+      const pub = await readPublicSnapshot(d.sheet);
+      return showTimeStep(d, q.chat_id, q.message_id, user.id, data, pub);
     }
     if (what === "name") {
       data.editing = true;
@@ -935,9 +953,8 @@ async function handleClientCallback(
     await answer({ toast: "Записую бронь…" });
     await editWizard(d, q.chat_id, q.message_id, "⏳ <b>Перевіряю доступність та записую бронь…</b>", { inline_keyboard: [] });
 
-    const settings = await loadSettings(d.sheet);
-    const { entries } = await activeClientEntries(d, user.id);
-    if (entries.length >= MAX_CLIENT_BOOKINGS) {
+    const { bookings, settings } = await readClientOwnBookings(d.sheet, d.db, user.id, nowMin(d));
+    if (bookings.length >= MAX_CLIENT_BOOKINGS) {
       await clearClientSession(d.db, user.id);
       await editWizard(
         d,
@@ -967,7 +984,7 @@ async function handleClientCallback(
     const id = newBookingId(now(d).getTime());
 
     try {
-      const rows = await placeClientBooking(d.sheet, booking, id, settings.pcList, settings.schedule);
+      const rows = await placeClientBooking(d.sheet, booking, id, settings.pcList, settings.schedule, settings.zones);
       await saveClientBooking(d.db, id, user.id);
       await clearClientSession(d.db, user.id);
       await audit(d.db, {
@@ -975,7 +992,7 @@ async function handleClientCallback(
         user_name: user.displayName,
         action: "client_book",
         card_id: id,
-        details: { rows, booking },
+        details: { rows, pcs: booking.pcs, date: booking.date, from: booking.from, to: booking.to },
       });
 
       const view = {
@@ -1007,7 +1024,7 @@ async function handleClientCallback(
           schedule: settings.schedule,
           zonePcs: zPcs,
           count: data.count!,
-          bookings: err.bookings,
+          bookings: err.busySlots,
           nowAbs: nowMin(d),
           stepMinutes: 60,
           minDurationMinutes: 60,
@@ -1074,7 +1091,6 @@ async function handleClientCallback(
         return;
       }
 
-      // Тимчасова помилка мережі або замка: повертаємо крок confirm, щоб можна було спробувати ще раз.
       await saveClientSession(d.db, { user_id: user.id, message_id: q.message_id, step: "confirm", data });
       throw err;
     }
@@ -1086,9 +1102,10 @@ async function handleClientCallback(
 
 export async function onClientText(
   d: Deps,
-  msg: { chat_id: number; message_id: number; text: string },
+  msg: { chat_id: number; message_id: number; text: string; chat_type?: string },
   user: ClientUser,
 ): Promise<void> {
+  if ((msg.chat_type ?? "private") !== "private") return;
   const session = await getClientSession(d.db, user.id);
   if (!session || !session.message_id || !["name_input", "phone_input"].includes(session.step)) {
     await d.api.sendMessage(msg.chat_id, "Користуйтесь кнопками меню нижче 👇", {
@@ -1146,9 +1163,10 @@ export async function onClientText(
 
 export async function onClientContact(
   d: Deps,
-  msg: { chat_id: number; message_id: number; phone_number: string },
+  msg: { chat_id: number; message_id: number; phone_number: string; chat_type?: string },
   user: ClientUser,
 ): Promise<void> {
+  if ((msg.chat_type ?? "private") !== "private") return;
   await d.api.deleteMessage(msg.chat_id, msg.message_id).catch(() => {});
   const session = await getClientSession(d.db, user.id);
   if (!session || !session.message_id || session.step !== "phone_input") return;

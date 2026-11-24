@@ -1,5 +1,6 @@
 // Доступ до таблиць D1: прив'язка гілки, картки, ForceReply-запити, журнал.
 
+import { isAdmin, type Env } from "./config";
 import type { Draft } from "./parse";
 
 export interface Binding {
@@ -154,6 +155,48 @@ export async function markClientBookingCancelled(db: D1Database, bookingId: stri
 
 export async function getClientBooking(db: D1Database, bookingId: string): Promise<ClientBookingRow | null> {
   return db.prepare("SELECT * FROM client_bookings WHERE booking_id = ?1").bind(bookingId).first<ClientBookingRow>();
+}
+
+/** Пошук активної броні з обов'язковою фільтрацією за `client_tg_id` на рівні SQL (IDOR-захист). */
+export async function getClientBookingForUser(
+  db: D1Database,
+  bookingId: string,
+  clientTgId: number,
+): Promise<ClientBookingRow | null> {
+  return db
+    .prepare("SELECT * FROM client_bookings WHERE booking_id = ?1 AND client_tg_id = ?2 AND status = 'active'")
+    .bind(bookingId, clientTgId)
+    .first<ClientBookingRow>();
+}
+
+export async function getActiveClientBookingById(db: D1Database, bookingId: string): Promise<ClientBookingRow | null> {
+  return db
+    .prepare("SELECT * FROM client_bookings WHERE booking_id = ?1 AND status = 'active'")
+    .bind(bookingId)
+    .first<ClientBookingRow>();
+}
+
+/** Перевірка власника або прав адміністратора перед будь-якою дією над `bookingId`. */
+export async function getAuthorizedClientBooking(
+  db: D1Database,
+  bookingId: string,
+  userId: number,
+  env: Env,
+): Promise<ClientBookingRow | null> {
+  if (!bookingId || !Number.isSafeInteger(userId) || userId <= 0) return null;
+  if (isAdmin(userId, env)) return getActiveClientBookingById(db, bookingId);
+  return getClientBookingForUser(db, bookingId, userId);
+}
+
+/** Закритий адмін-канал: прив'язана гілка в D1 або резервний `ADMIN_CHAT_ID` з env. */
+export async function getAdminChannel(db: D1Database, env: Env): Promise<Binding | null> {
+  const binding = await getBinding(db);
+  if (binding) return binding;
+  const chatId = Number(String(env.ADMIN_CHAT_ID ?? "").trim());
+  if (!Number.isSafeInteger(chatId) || chatId === 0) return null;
+  const threadRaw = Number(String(env.ADMIN_THREAD_ID ?? "").trim());
+  const threadId = Number.isSafeInteger(threadRaw) && threadRaw > 0 ? threadRaw : null;
+  return { chat_id: chatId, thread_id: threadId };
 }
 
 export async function listClientBookings(db: D1Database, clientTgId: number): Promise<ClientBookingRow[]> {

@@ -11,18 +11,23 @@ import {
   FIRST_ROW,
   LAST_ROW,
   bookingInterval,
+  complete,
   findConflicts,
   freeRows,
   parseBookingRows,
+  pcsInRange,
   rowValues,
   splitIntoRuns,
-  type Conflict,
+  toPublicBusySlots,
   type NewBooking,
+  type PublicSlotSummary,
   type SheetBooking,
 } from "./bookings";
+import type { Env } from "./config";
 import { cacheDelete, cacheGet, cachePut, withLock } from "./db";
 import { getAccessToken, resetTokenMemory, type FetchFn } from "./google";
 import { isWithinHours, parseSchedule, type DaySchedule } from "./hours";
+import { getAuthorizedClientBooking, listClientBookings } from "./store";
 import { fractionToMinutes } from "./time";
 
 export const BOOKINGS = "Бронювання";
@@ -72,10 +77,7 @@ export class SheetFullError extends Error {
 export class WriteVerifyError extends Error {}
 
 export class BookingConflictError extends Error {
-  constructor(
-    readonly conflicts: Conflict[],
-    readonly bookings: SheetBooking[],
-  ) {
+  constructor(readonly busySlots: PublicSlotSummary[]) {
     super("Обрані ПК вже зайнято на цей час");
   }
 }
@@ -168,7 +170,7 @@ export interface Snapshot {
   settings: Settings;
 }
 
-/** Броні завжди свіжі; налаштування — з кешу, а якщо його немає — тим самим запитом. */
+/** Броні завжди свіжі (тільки для адмінів); налаштування — з кешу, а якщо його немає — тим самим запитом. */
 export async function readSnapshot(ctx: SheetCtx): Promise<Snapshot> {
   const cached = await cacheGet(ctx.db, SETTINGS_CACHE_KEY);
   const ranges = [range(BOOKINGS, `A${FIRST_ROW}:U${LAST_ROW}`), range(BOOKINGS, "F3"), ...(cached ? [] : SETTINGS_RANGES)];
@@ -181,6 +183,89 @@ export async function readSnapshot(ctx: SheetCtx): Promise<Snapshot> {
   }
   const wm = week?.[0]?.[0];
   return { bookings: parseBookingRows(rows ?? []), weekMon: typeof wm === "number" ? Math.floor(wm) : 0, settings };
+}
+
+/** Публічний знімок доступності для клієнтів: виключно `PublicSlotSummary[]` без жодних PII. */
+export async function readPublicSnapshot(ctx: SheetCtx): Promise<{ busySlots: PublicSlotSummary[]; settings: Settings }> {
+  const snap = await readSnapshot(ctx);
+  return {
+    busySlots: toPublicBusySlots(snap.bookings, snap.settings.pcList, snap.settings.zones),
+    settings: snap.settings,
+  };
+}
+
+/** Власна бронь клієнта (повертається лише власнику після SQL-перевірки `client_tg_id`). */
+export interface ClientOwnBooking {
+  id: string;
+  date: number;
+  start: number;
+  end: number;
+  pcs: number[];
+  zone: string;
+  name: string;
+  contact: string;
+}
+
+function groupClientOwnBookings(bookings: SheetBooking[], allowedIds: Set<string>, settings: Settings): ClientOwnBooking[] {
+  const byId = new Map<string, ClientOwnBooking>();
+  for (const raw of bookings) {
+    if (!raw.botId || !allowedIds.has(raw.botId)) continue;
+    const b = complete(raw);
+    if (!b) continue;
+    const pcs = pcsInRange(settings.pcList, b.lo, b.hi);
+    const list = pcs.length ? pcs : [b.lo];
+    const existing = byId.get(raw.botId);
+    if (existing) {
+      existing.pcs = [...new Set([...existing.pcs, ...list])].sort((x, y) => x - y);
+      existing.zone = [...new Set(existing.pcs.map((pc) => (settings.zones[pc] ?? "").trim()).filter(Boolean))].join(" + ");
+      continue;
+    }
+    const zone = [...new Set(list.map((pc) => (settings.zones[pc] ?? "").trim()).filter(Boolean))].join(" + ");
+    byId.set(raw.botId, {
+      id: raw.botId,
+      date: b.date,
+      start: b.start,
+      end: b.end,
+      pcs: list,
+      zone,
+      name: b.name,
+      contact: b.contact,
+    });
+  }
+  return [...byId.values()].sort((a, b) => a.start - b.start || a.pcs[0]! - b.pcs[0]!);
+}
+
+/** Прочитати лише власні активні броні клієнта (фільтрація в SQL за `client_tg_id`). */
+export async function readClientOwnBookings(
+  ctx: SheetCtx,
+  db: D1Database,
+  clientTgId: number,
+  nowAbsVal?: number,
+): Promise<{ bookings: ClientOwnBooking[]; settings: Settings }> {
+  const mine = await listClientBookings(db, clientTgId);
+  if (!mine.length) return { bookings: [], settings: await loadSettings(ctx) };
+  const allowedIds = new Set(mine.map((r) => r.booking_id));
+  const snap = await readSnapshot(ctx);
+  const allOwn = groupClientOwnBookings(snap.bookings, allowedIds, snap.settings);
+  const bookings = nowAbsVal === undefined ? allOwn : allOwn.filter((b) => b.end > nowAbsVal);
+  return { bookings, settings: snap.settings };
+}
+
+/** Авторизоване читання конкретної броні за ID з перевіркою власника або ролі адміністратора. */
+export async function readAuthorizedClientBooking(
+  ctx: SheetCtx,
+  db: D1Database,
+  bookingId: string,
+  userId: number,
+  env: Env,
+): Promise<{ booking: ClientOwnBooking; ownerTgId: number; settings: Settings } | null> {
+  const row = await getAuthorizedClientBooking(db, bookingId, userId, env);
+  if (!row) return null;
+  const snap = await readSnapshot(ctx);
+  const list = groupClientOwnBookings(snap.bookings, new Set([bookingId]), snap.settings);
+  const booking = list[0];
+  if (!booking) return null;
+  return { booking, ownerTgId: row.client_tg_id, settings: snap.settings };
 }
 
 /** Рядки, у колонці U яких стоїть цей ID. */
@@ -249,6 +334,7 @@ export async function placeClientBooking(
   id: string,
   pcList: number[],
   schedule: DaySchedule[],
+  zones: Record<number, string> = {},
 ): Promise<number[]> {
   const runs = splitIntoRuns(booking.pcs, pcList);
   if (!runs.length) throw new Error("Жодного ПК зі списку «Налаштування» не вибрано");
@@ -259,7 +345,7 @@ export async function placeClientBooking(
     const { start, end } = bookingInterval(booking.date, booking.from, booking.to);
     if (!isWithinHours(schedule, booking.date, start, end)) throw new BookingOutOfHoursError();
     const conflicts = findConflicts({ pcs: booking.pcs, start, end }, freshBookings);
-    if (conflicts.length) throw new BookingConflictError(conflicts, freshBookings);
+    if (conflicts.length) throw new BookingConflictError(toPublicBusySlots(freshBookings, pcList, zones));
 
     const cells = Array.from({ length: LAST_ROW - FIRST_ROW + 1 }, (_, i) => ({
       a: raw?.[i]?.[0],

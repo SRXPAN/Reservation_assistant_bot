@@ -8,6 +8,7 @@ import {
   findAvailableDurations,
   findAvailableStartTimes,
   findConflicts,
+  findPublicSlotSummaries,
   freeRows,
   intervalToBookingTime,
   isOkStatus,
@@ -15,6 +16,7 @@ import {
   parseBookingRows,
   rowValues,
   splitIntoRuns,
+  toPublicBusySlots,
   zonePCs,
 } from "../src/bookings";
 import { parseSchedule } from "../src/hours";
@@ -372,5 +374,43 @@ describe("клієнтський підбір слотів і суміжних �
       { m: 300, close: false },
       { m: 480, close: true },
     ]);
+  });
+
+  it("toPublicBusySlots і findPublicSlotSummaries фізично не містять PII", () => {
+    const raw = parseBookingRows([
+      sheetRow({ date: FRI, b: 18, c: 19, from: "19:00", to: "21:00", name: "Секретний Гість", contact: "+48 500 600 700", id: "R-sec" }),
+    ]);
+    const busy = toPublicBusySlots(raw, PC_LIST, ZONES);
+    expect(busy).toEqual([
+      { date: FRI, start: FRI * 1440 + 19 * H, end: FRI * 1440 + 21 * H, zone: "Stream", pcs: [18, 19], status: "busy" },
+    ]);
+    const serialized = JSON.stringify(busy);
+    expect(serialized).not.toContain("Секретний");
+    expect(serialized).not.toContain("500 600");
+    expect(serialized).not.toContain("R-sec");
+
+    const summary = findPublicSlotSummaries({
+      daySerial: FRI,
+      schedule,
+      zone: "Stream",
+      zonePcs: STREAM_PCS,
+      count: 1,
+      busySlots: busy,
+      nowAbs: FRI * 1440 + 18 * H,
+    });
+    const slot19 = summary.find((s) => s.start === FRI * 1440 + 19 * H)!;
+    expect(slot19).toMatchObject({ zone: "Stream", status: "busy", freeCount: 0, pcs: [] });
+    const slot21 = summary.find((s) => s.start === FRI * 1440 + 21 * H)!;
+    expect(slot21).toMatchObject({ zone: "Stream", status: "free", freeCount: 2, pcs: [18, 19] });
+
+    // Підбір тривалості також працює напряму поверх PublicSlotSummary[]
+    const durs = findAvailableDurations({
+      startAbs: FRI * 1440 + 18 * H,
+      schedule,
+      zonePcs: STREAM_PCS,
+      count: 1,
+      bookings: busy,
+    });
+    expect(durs.map((d) => d.minutes)).toEqual([60]);
   });
 });

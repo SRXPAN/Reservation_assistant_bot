@@ -4,6 +4,7 @@ import type { AiBinding } from "./ai";
 import { createBot } from "./bot";
 import type { Env } from "./config";
 import { verifyCard, type Deps } from "./flow";
+import { safeError } from "./log";
 import { runReminders, type RunResult } from "./reminders";
 import { loadSettings } from "./sheet";
 import { getBinding, pendingVerifications } from "./store";
@@ -93,7 +94,7 @@ export default {
           const bot = createBot(env, { deadline, ai: env.AI });
           if (!env.BOT_INFO) await bot.init();
           await bot.handleUpdate(update);
-        })().catch((err) => console.error("Помилка обробки оновлення", err)),
+        })().catch((err) => console.error("Помилка обробки оновлення", safeError(err))),
       );
       return new Response("ok");
     }
@@ -137,7 +138,7 @@ export default {
         .then((r) => {
           if (r.reminders.sent || r.reminders.failed || r.verified) console.log("Cron:", JSON.stringify(r));
         })
-        .catch((err) => console.error("Cron завершився помилкою", err)),
+        .catch((err) => console.error("Cron завершився помилкою", safeError(err))),
     );
   },
 };

@@ -25,8 +25,9 @@ import {
   type Keyboard,
 } from "./card";
 import { botVerdictOk, evaluate, hasWarnings, toNewBooking, type Check } from "./check";
-import { sheetUrl, type Env } from "./config";
+import { isAdmin, sheetUrl, type Env } from "./config";
 import { LockBusyError } from "./db";
+import { safeError } from "./log";
 import { emptyDraft, normalizeContact, parseBooking, parseDateInput, parsePcsInput, parseTimeInput, type Draft } from "./parse";
 import {
   BookingMissingError,
@@ -209,6 +210,7 @@ export async function onBookingText(
   msg: { chat_id: number; thread_id: number | null; message_id: number; text: string },
   who: Who,
 ): Promise<boolean> {
+  if (!isAdmin(who.id, d.env)) return false;
   const settings = await loadSettings(d.sheet);
   const today = zonedNow(tz(d), now(d)).serial;
   const parsed = parseBooking(msg.text, { today, pcList: settings.pcList });
@@ -242,7 +244,7 @@ async function recheckDraft(d: Deps, id: string, draft: Draft, settings: CardSet
     const ev = await evaluateDraft(d, draft);
     await updateCard(d.db, id, { body: ev.body, kb: JSON.stringify(draftKeyboard(id, ev.check, false)), bot_ok: botVerdictOk(ev.check) ? 1 : 0, error: null });
   } catch (err) {
-    console.error("Перевірка чернетки", id, err);
+    console.error("Перевірка чернетки", id, safeError(err));
     await updateCard(d.db, id, {
       body: fieldsBlock(draft, settings).join("\n"),
       kb: JSON.stringify(retryKeyboard(id)),
@@ -254,7 +256,7 @@ async function recheckDraft(d: Deps, id: string, draft: Draft, settings: CardSet
 
 /** Будь-яка непередбачена помилка під час дії з карткою: картка не «зависає», а показує помилку. */
 async function reportCardError(d: Deps, id: string | null | undefined, err: unknown) {
-  console.error("Помилка дії з карткою", id, err);
+  console.error("Помилка дії з карткою", id, safeError(err));
   if (!id) return;
   const card = await getCard(d.db, id);
   if (!card) return;
@@ -274,6 +276,10 @@ type Answer = (r: CallbackResult) => Promise<void>;
 
 /** Обробка натискання на картці. `answer` викликається якомога раніше — до повільних запитів до таблиці. */
 export async function onCallback(d: Deps, q: { data: string; chat_id: number; message_id: number }, who: Who, answer: Answer): Promise<void> {
+  if (!isAdmin(who.id, d.env)) {
+    await answer({ toast: "Немає доступу." });
+    return;
+  }
   try {
     await handleCallback(d, q, who, answer);
   } catch (err) {
@@ -489,7 +495,7 @@ async function save(d: Deps, card: CardRow, who: Who, force: boolean, answer: An
     }
     const reason =
       err instanceof LockBusyError || err instanceof SheetFullError ? err.message : `Не вдалося записати: ${err instanceof Error ? err.message : String(err)}`;
-    console.error("Запис броні", id, err);
+    console.error("Запис броні", id, safeError(err));
     await updateCard(d.db, id, { state: from, error: reason });
     await showCard(d, await reload(d, id));
     await audit(d.db, { user_id: who.id, user_name: who.name, action: "save_error", card_id: id, details: reason });
@@ -513,7 +519,7 @@ async function remove(d: Deps, card: CardRow, who: Who, answer: Answer) {
     await showCard(d, await reload(d, id));
     await audit(d.db, { user_id: who.id, user_name: who.name, action: rows.length ? "delete" : "delete_missing", card_id: id, details: { rows } });
   } catch (err) {
-    console.error("Скасування броні", id, err);
+    console.error("Скасування броні", id, safeError(err));
     await updateCard(d.db, id, { state: "saved", error: `Не вдалося скасувати: ${err instanceof Error ? err.message : String(err)}` });
     await showCard(d, await reload(d, id));
   }
@@ -612,6 +618,7 @@ export async function onPromptReply(
   msg: { chat_id: number; thread_id: number | null; message_id: number; reply_to: number; text: string },
   who: Who,
 ): Promise<boolean> {
+  if (!isAdmin(who.id, d.env)) return false;
   const prompt = await takePrompt(d.db, msg.chat_id, msg.reply_to);
   if (!prompt) return false;
   const place: Place = { chat_id: msg.chat_id, thread_id: msg.thread_id };
@@ -708,10 +715,14 @@ async function showSearch(d: Deps, place: Place, query: string, who: Who) {
 
 /** Кнопки закріпленого меню: m:today / m:tomorrow / m:free / m:search / m:new. */
 export async function onMenu(d: Deps, act: string, place: Place, who: Who, answer: Answer): Promise<void> {
+  if (!isAdmin(who.id, d.env)) {
+    await answer({ toast: "Немає доступу." });
+    return;
+  }
   try {
     await handleMenu(d, act, place, who, answer);
   } catch (err) {
-    console.error("Меню", act, err);
+    console.error("Меню", act, safeError(err));
     await answer({});
     await sendInThread(d, place, `❗ Не вдалося прочитати таблицю (${esc(err instanceof Error ? err.message : String(err))}). Спробуйте ще раз.`).catch(() => {});
   }

@@ -18,6 +18,8 @@ enabled = true
 [vars]
 # Telegram ID власника (число, рядком).
 OWNER_ID = "8769109427"
+# Додаткові Telegram ID адміністраторів (через кому, напр. "123456, 789012"). Власник завжди адмін.
+ADMIN_IDS = ""
 TZ = "Europe/Warsaw"
 SHEET_ID = "1ZTh4vIN7AEc49d4y3xXlZjB3TpM2VIuYxyh7_N2pvKc"
 # JSON із відповіді getMe — заповнюється після /setup, щоб не викликати getMe на кожен запит.

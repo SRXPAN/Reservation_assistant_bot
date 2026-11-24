@@ -8,6 +8,7 @@ import { CLIENT_NOTE } from "../src/client_flow";
 import type { Env } from "../src/config";
 import { resetTokenMemory } from "../src/google";
 import { runCron } from "../src/index";
+import { safeError } from "../src/log";
 import { BOOKINGS, SETTINGS } from "../src/sheet";
 import { getClientBooking, getClientSession } from "../src/store";
 import { dateToSerial } from "../src/time";
@@ -452,5 +453,100 @@ describe("клієнтський самозапис у ЛС", () => {
     await clickPm(`c:rem:canok:${bookingId}`, remMsgId, { username: "alex" });
     expect(parseBookingRows(google.read(`'${BOOKINGS}'!A10:U20`))).toEqual([]);
     expect(calls.some((c) => c.method === "sendMessage" && c.payload.chat_id === GROUP_CHAT && String(c.payload.text).includes("Клієнт скасував бронь"))).toBe(true);
+  });
+
+  it("клієнт у DM бачить лише статус зайнятості без PII чужих гостей (c:info та накладка)", async () => {
+    google.setRow(
+      BOOKINGS,
+      10,
+      sheetRow({ date: THU, b: 18, from: "15:00", to: "20:00", name: "ТаємнийГість", contact: "+48 111 222 333" }),
+    );
+    google.setRow(
+      BOOKINGS,
+      11,
+      sheetRow({ date: FRI, b: 19, from: "19:00", to: "22:00", name: "СекретнаОльга", contact: "@secret_olga" }),
+    );
+
+    await sendPm("/start", { username: "alex" });
+    const wizId = msgId;
+    await clickPm("c:info", wizId, { username: "alex" });
+    const infoText = last("editMessageText").payload.text as string;
+    expect(infoText).toContain("<b>Stream:</b> вільно 1 з 2 ПК");
+    expect(infoText).not.toContain("ТаємнийГість");
+    expect(infoText).not.toContain("111 222 333");
+    expect(infoText).not.toContain("СекретнаОльга");
+    expect(infoText).not.toContain("@secret_olga");
+
+    // Також під час вибору часу не з'являються імена інших гостей
+    await clickPm("c:book", wizId, { username: "alex" });
+    await clickPm(`c:d:${FRI}`, wizId, { username: "alex" });
+    await clickPm("c:z:1", wizId, { username: "alex" });
+    await clickPm("c:n:2", wizId, { username: "alex" });
+    const timeMsg = last("editMessageText").payload.text as string;
+    expect(timeMsg).not.toContain("СекретнаОльга");
+    expect(timeMsg).not.toContain("@secret_olga");
+  });
+
+  it("IDOR-захист: клієнт Б не може переглядати, підтверджувати чи скасовувати бронь клієнта А підміною bookingId", async () => {
+    await sendPm("/start", { username: "alex" });
+    const w = msgId;
+    await clickPm("c:book", w, { username: "alex" });
+    await clickPm(`c:d:${FRI}`, w, { username: "alex" });
+    await clickPm("c:z:0", w, { username: "alex" });
+    await clickPm("c:n:1", w, { username: "alex" });
+    await clickPm(`c:t:${FRI * 1440 + 19 * 60}`, w, { username: "alex" });
+    await clickPm("c:dur:120", w, { username: "alex" });
+    await clickPm("c:nm:tg", w, { username: "alex" });
+    await clickPm("c:ct:skip", w, { username: "alex" });
+    await clickPm("c:ok", w, { username: "alex" });
+
+    const bookingId = parseBookingRows(google.read(`'${BOOKINGS}'!A10:U20`))[0]!.botId;
+
+    // Клієнт Б (CLIENT_2) відкриває меню і пробує підставити bookingId клієнта А в усі можливі callback_data
+    await sendPm("/start", { userId: CLIENT_2, firstName: "Зловмисник" });
+    const attackerMsgId = msgId;
+
+    const idorPayloads = [
+      `c:myview:${bookingId}`,
+      `c:mycan:${bookingId}`,
+      `c:mycanok:${bookingId}`,
+      `c:rem:ok:${bookingId}`,
+      `c:rem:can:${bookingId}`,
+      `c:rem:canok:${bookingId}`,
+      `c:rem:back:${bookingId}`,
+    ];
+    for (const payload of idorPayloads) {
+      calls = [];
+      await clickPm(payload, attackerMsgId, { userId: CLIENT_2, firstName: "Зловмисник" });
+      const ans = calls.find((c) => c.method === "answerCallbackQuery");
+      expect(ans?.payload.text).toBe("Бронь недоступна.");
+      // Жодних повідомлень із деталями жертви чи змін у таблиці не має бути
+      expect(calls.some((c) => c.method === "editMessageText" || c.method === "sendMessage")).toBe(false);
+    }
+
+    // Бронь клієнта А залишилась активною і недоторканою
+    expect(parseBookingRows(google.read(`'${BOOKINGS}'!A10:U20`))).toHaveLength(1);
+    expect(await getClientBooking(env.DB, bookingId)).toMatchObject({ client_tg_id: CLIENT_1, status: "active" });
+
+    // А сам власник (CLIENT_1) може переглядати деталі своєї броні через c:myview
+    calls = [];
+    await clickPm(`c:myview:${bookingId}`, w, { username: "alex" });
+    expect(last("editMessageText").payload.text).toContain("Деталі бронювання");
+    expect(last("editMessageText").payload.text).toContain("@alex");
+  });
+
+  it("гігієна логів: safeError приховує payload.text, номери телефонів та @username", () => {
+    const fakeGrammyErr = {
+      name: "GrammyError",
+      error_code: 400,
+      description: "Bad Request: phone +48 501 234 567 or @secret_client invalid",
+      payload: { chat_id: 123, text: "Олександр +48 501 234 567 секрет" },
+    };
+    const out = safeError(fakeGrammyErr);
+    expect(out).not.toContain("+48 501 234 567");
+    expect(out).not.toContain("@secret_client");
+    expect(out).not.toContain("Олександр");
+    expect(out).toContain("[redacted-phone]");
+    expect(out).toContain("[redacted-user]");
   });
 });

@@ -1,10 +1,20 @@
 // Списки для меню: «Сьогодні / Завтра», «Вільні зараз», «Пошук». Без мережі — перевіряються тестами.
 
-import { complete, pcsInRange, type SheetBooking } from "./bookings";
+import {
+  availableZones,
+  complete,
+  pcsInRange,
+  zonePCs,
+  type AdminBookingDetails,
+  type PublicSlotSummary,
+  type SheetBooking,
+} from "./bookings";
 import { esc, pcsLabel } from "./card";
 import { openWindowAt, windowOf, type DaySchedule } from "./hours";
 import { WEEKDAY_SHORT } from "./parse";
 import { MIN_PER_DAY, formatHHMM, serialToDate, weekdayIndex } from "./time";
+
+export type { AdminBookingDetails, PublicSlotSummary };
 
 export interface ViewSettings {
   pcList: number[];
@@ -12,18 +22,7 @@ export interface ViewSettings {
 }
 
 /** Бронь для показу: рядки з однаковим ID бота злиті в одну (несуміжні ПК). */
-export interface Entry {
-  id: string;
-  rows: number[];
-  date: number;
-  start: number;
-  end: number;
-  pcs: number[];
-  name: string;
-  contact: string;
-  note: string;
-  statuses: string[];
-}
+export type Entry = AdminBookingDetails;
 
 export function toEntries(bookings: SheetBooking[], pcList: number[]): Entry[] {
   const byId = new Map<string, Entry>();
@@ -177,5 +176,44 @@ export function searchView(entries: Entry[], s: ViewSettings, query: string, now
   const lines = [head];
   if (upcoming.length) lines.push("", "Майбутні:", ...clip(upcoming.map((e) => line(e, s.pcList, true))));
   if (past.length) lines.push("", "Минулі (останні):", ...past.map((e) => line(e, s.pcList, true)));
+  return lines.join("\n");
+}
+
+/** Публічний статус доступності зараз (виключно `PublicSlotSummary` — без імен, телефонів чи приміток). */
+export function publicAvailabilityView(
+  busySlots: readonly PublicSlotSummary[],
+  s: ViewSettings & { zones: Record<number, string> },
+  now: number,
+): string {
+  const window = openWindowAt(s.schedule, now);
+  if (!window) {
+    let next: number | null = null;
+    for (let day = Math.floor(now / MIN_PER_DAY); day <= Math.floor(now / MIN_PER_DAY) + 7 && next === null; day++) {
+      const w = windowOf(s.schedule, day);
+      if (w.end > w.start && w.start > now) next = w.start;
+    }
+    return `🔒 Клуб зараз зачинений.${next !== null ? ` Відкриття: ${dayTitle(Math.floor(next / MIN_PER_DAY))} о ${formatHHMM(next)}.` : ""}`;
+  }
+
+  const busyNow = new Set<number>();
+  for (const slot of busySlots) {
+    if (slot.status !== "busy") continue;
+    if (slot.start <= now && slot.end > now) {
+      for (const pc of slot.pcs) busyNow.add(pc);
+    }
+  }
+
+  const zones = availableZones(s.pcList, s.zones);
+  const lines = [`🟢 <b>Вільні місця зараз</b> · ${dayTitle(Math.floor(now / MIN_PER_DAY))} ${formatHHMM(now)}`];
+  if (!zones.length) {
+    const free = s.pcList.filter((pc) => !busyNow.has(pc)).length;
+    lines.push(`• Вільно ${free} з ${s.pcList.length} ПК`);
+    return lines.join("\n");
+  }
+  for (const z of zones) {
+    const zPcs = zonePCs(s.pcList, s.zones, z);
+    const free = zPcs.filter((pc) => !busyNow.has(pc)).length;
+    lines.push(`• <b>${esc(z)}:</b> вільно ${free} з ${zPcs.length} ПК`);
+  }
   return lines.join("\n");
 }

@@ -16,6 +16,7 @@ import { CLUB_HOURS_ROWS, PC_LIST, fakeD1, sheetRow } from "./helpers";
 
 const OWNER = 1000;
 const ADMIN = 2000;
+const NON_ADMIN = 3000;
 const CHAT = -100500;
 const THREAD = 7;
 const BOT_ID = 42;
@@ -56,6 +57,7 @@ beforeEach(() => {
     WEBHOOK_SECRET: "s",
     GOOGLE_SA_KEY: rawKey,
     OWNER_ID: String(OWNER),
+    ADMIN_IDS: String(ADMIN),
     TZ: "Europe/Warsaw",
     SHEET_ID: "SHEET",
     BOT_INFO: JSON.stringify({ id: BOT_ID, is_bot: true, first_name: "Бот", username: "res_bot", can_join_groups: true, can_read_all_group_messages: true, supports_inline_queries: false }),
@@ -139,7 +141,8 @@ describe("прив'язка гілки", () => {
     expect(calls).toEqual([]);
 
     await send("/start", { from: ADMIN });
-    expect(last("sendMessage").payload).toMatchObject({ text: "Прив'язати гілку для бронювань може лише власник бота.", message_thread_id: THREAD });
+    expect(last("sendMessage").payload.text).toContain("доступні лише в особистих повідомленнях");
+    expect(buttons(last("sendMessage"))).toEqual(["https://t.me/res_bot?start=book"]);
 
     // Власник пише анонімно від імені групи — Telegram підставляє службовий акаунт.
     calls = [];
@@ -604,13 +607,13 @@ describe("етап 3: записана бронь, меню, журнал", () =
     expect(parseBookingRows(google.read(`'${BOOKINGS}'!A10:U30`)).filter((r) => r.botId === id)).toMatchObject([{ row: 25, pcB: 6, to: 22 * 60 }]);
   });
 
-  it("журнал: /log лише для власника; хто, коли, що", async () => {
+  it("журнал: /log лише для адміністратора; хто, коли, що", async () => {
     const { id, cardMsg } = await saved("пт пк 5 з 19 до 21 Олег tg");
     await click(`d|${id}`, cardMsg);
     await click(`D|${id}`, cardMsg);
     await click("m:today", 1);
 
-    await send("/log", { from: ADMIN });
+    await send("/log", { from: NON_ADMIN });
     expect(calls.some((c) => c.method === "sendMessage" && String(c.payload.text).includes("Останні дії"))).toBe(false);
     await send("/log", { from: OWNER });
     const log = last("sendMessage").payload.text as string;
@@ -619,5 +622,125 @@ describe("етап 3: записана бронь, меню, журнал", () =
       expect(log).toContain(what);
     }
     expect(log).toContain(`<code>${id}</code>`);
+  });
+});
+
+describe("ізоляція прав та приватність груп", () => {
+  beforeEach(bind);
+
+  it("публічна/неприв'язана група: /start, /book і @res_bot перенаправляють у DM без розкриття броней", async () => {
+    const pubChat = { id: -100999, type: "supergroup" as const, title: "Публічний чат" };
+    for (const text of ["/start", "/book", "привіт @res_bot, є вільні пк?"]) {
+      calls = [];
+      await handle({
+        message: {
+          message_id: ++msgId,
+          date: 0,
+          chat: pubChat,
+          from: user(NON_ADMIN, "Гість"),
+          text,
+          ...(text.startsWith("/") ? { entities: [{ type: "bot_command", offset: 0, length: text.split(" ")[0]!.length }] } : {}),
+        } as any,
+      });
+      const reply = last("sendMessage");
+      expect(reply.payload.chat_id).toBe(-100999);
+      expect(reply.payload.text).toContain("лише в особистих повідомленнях");
+      expect(reply.payload.text).not.toContain("Андрій");
+      expect(buttons(reply)).toEqual(["https://t.me/res_bot?start=book"]);
+    }
+
+    // Звичайна переписка без команд і без згадки — тиша.
+    calls = [];
+    await handle({
+      message: {
+        message_id: ++msgId,
+        date: 0,
+        chat: pubChat,
+        from: user(NON_ADMIN, "Гість"),
+        text: "Хто піде в клуб?",
+      } as any,
+    });
+    expect(calls).toEqual([]);
+  });
+
+  it("не-адмін не може викликати адмін-команди, меню, картки, відмітки чи адмінський парсер", async () => {
+    const { id, cardMsg } = await booking("пт пк 5 з 19 до 21 Олег tg");
+    calls = [];
+
+    // Текстова адмінська бронь від не-адміна у групі ігнорується.
+    await send("пт пк 6 з 19 до 21 Іван tg", { from: NON_ADMIN });
+    expect(calls).toEqual([]);
+
+    // Адмінські кнопки меню і карток блокуються.
+    await click("m:today", 1, { from: NON_ADMIN });
+    expect(toasts().at(-1)).toBe("Немає доступу.");
+    expect(calls.some((c) => c.method === "sendMessage")).toBe(false);
+
+    await click(`s|${id}`, cardMsg, { from: NON_ADMIN });
+    expect(toasts().at(-1)).toBe("Немає доступу.");
+    expect(google.calls.some((c) => c.url.includes("batchUpdate"))).toBe(false);
+
+    // Адмін-команди в приваті для не-адміна відхиляються без розкриття даних.
+    const pmChat = { id: NON_ADMIN, type: "private" as const, first_name: "Гість" };
+    for (const cmd of ["/admin", "/log"]) {
+      calls = [];
+      await handle({
+        message: {
+          message_id: ++msgId,
+          date: 0,
+          chat: pmChat,
+          from: user(NON_ADMIN, "Гість"),
+          text: cmd,
+          entities: [{ type: "bot_command", offset: 0, length: cmd.length }],
+        } as any,
+      });
+      expect(last("sendMessage").payload.text).toContain("лише адміністраторам");
+    }
+
+    // Клієнтські callback-и (c:*) у групі блокуються.
+    calls = [];
+    await click("c:book", 1, { from: NON_ADMIN });
+    expect(toasts().at(-1)).toBe("Доступно лише в особистих повідомленнях.");
+  });
+
+  it("адмін у приваті бачить повну адмін-панель, список з PII і картки бронювань", async () => {
+    const pmChat = { id: ADMIN, type: "private" as const, first_name: "Сеня" };
+    await handle({
+      message: {
+        message_id: ++msgId,
+        date: 0,
+        chat: pmChat,
+        from: user(ADMIN, "Сеня"),
+        text: "/admin",
+        entities: [{ type: "bot_command", offset: 0, length: 6 }],
+      } as any,
+    });
+    const menuMsg = last("sendMessage");
+    const menuId = msgId;
+    expect(menuMsg.payload.chat_id).toBe(ADMIN);
+    expect(buttons(menuMsg)).toContain("m:tomorrow");
+
+    await handle({
+      callback_query: {
+        id: "q",
+        chat_instance: "c",
+        from: user(ADMIN, "Сеня"),
+        data: "m:tomorrow",
+        message: { message_id: menuId, date: 0, chat: pmChat },
+      } as any,
+    });
+    expect(last("sendMessage").payload.text).toContain("Андрій · +48 501 234 567");
+
+    // Адмін може надіслати бронь текстом у приваті й отримати повну картку.
+    await handle({
+      message: {
+        message_id: ++msgId,
+        date: 0,
+        chat: pmChat,
+        from: user(ADMIN, "Сеня"),
+        text: "пт пк 8 з 19 до 21 Олена +48 555 666 777",
+      } as any,
+    });
+    expect(cardText()).toContain("👤 Олена · +48 555 666 777");
   });
 });

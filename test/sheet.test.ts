@@ -17,10 +17,13 @@ import {
   ensureIdHeader,
   findRowsById,
   loadSettings,
+  readClientOwnBookings,
+  readPublicSnapshot,
   readSnapshot,
   writeBooking,
   type SheetCtx,
 } from "../src/sheet";
+import { saveClientBooking } from "../src/store";
 import { dateToSerial } from "../src/time";
 import { FakeGoogle, makeServiceAccountKey } from "./fakeSheets";
 import { CLUB_HOURS_ROWS, PC_LIST, fakeD1, sheetRow } from "./helpers";
@@ -187,20 +190,27 @@ describe("заголовок U9", () => {
   });
 });
 
-describe("атомарний клієнтський запис під замком", () => {
-  it("перевіряє свіжу таблицю на накладку і години перед записом", async () => {
+describe("атомарний клієнтський запис під замком і ізоляція читання", () => {
+  it("перевіряє свіжу таблицю на накладку і години перед записом; BookingConflictError без PII", async () => {
     const settings = await loadSettings(ctx);
     // У таблиці вже є бронь на вт ПК 5 18:00–20:00
-    google.setRow(BOOKINGS, 12, sheetRow({ date: TUE, b: 5, from: "18:00", to: "20:00", name: "Хтось" }));
-    await expect(
-      placeClientBooking(
+    google.setRow(BOOKINGS, 12, sheetRow({ date: TUE, b: 5, from: "18:00", to: "20:00", name: "ЧужеІм'я", contact: "+48 999 888 777" }));
+    let caught: unknown;
+    try {
+      await placeClientBooking(
         ctx,
         { date: TUE, pcs: [5], from: 19 * 60, to: 21 * 60, name: "Клієнт", contact: "@u", note: "клієнт через бот" },
         "R-cl-1",
         PC_LIST,
         settings.schedule,
-      ),
-    ).rejects.toThrow(BookingConflictError);
+        settings.zones,
+      );
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(BookingConflictError);
+    expect(JSON.stringify((caught as BookingConflictError).busySlots)).not.toContain("ЧужеІм'я");
+    expect(JSON.stringify((caught as BookingConflictError).busySlots)).not.toContain("999 888");
 
     // Поза годинами роботи (вт о 09:00)
     await expect(
@@ -210,6 +220,7 @@ describe("атомарний клієнтський запис під замко
         "R-cl-2",
         PC_LIST,
         settings.schedule,
+        settings.zones,
       ),
     ).rejects.toThrow(BookingOutOfHoursError);
 
@@ -220,8 +231,20 @@ describe("атомарний клієнтський запис під замко
       "R-cl-3",
       PC_LIST,
       settings.schedule,
+      settings.zones,
     );
     expect(rows).toEqual([13]);
     expect(google.get(BOOKINGS, 13, 20)).toBe("R-cl-3");
+
+    // readPublicSnapshot не містить жодних PII; readClientOwnBookings повертає лише броні цього user_id
+    await saveClientBooking(ctx.db, "R-cl-3", 777);
+    const pub = await readPublicSnapshot(ctx);
+    expect(JSON.stringify(pub.busySlots)).not.toContain("ЧужеІм'я");
+    expect(JSON.stringify(pub.busySlots)).not.toContain("Клієнт");
+
+    const own777 = await readClientOwnBookings(ctx, ctx.db, 777);
+    expect(own777.bookings.map((b) => b.id)).toEqual(["R-cl-3"]);
+    const own888 = await readClientOwnBookings(ctx, ctx.db, 888);
+    expect(own888.bookings).toEqual([]);
   });
 });

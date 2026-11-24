@@ -228,6 +228,58 @@ export function newBookingId(now: number = Date.now()): string {
 
 /* ───────────── клієнтський підбір слотів і суміжних ПК ───────────── */
 
+/** Публічний DTO доступності слотів/ПК — фізично без жодних персональних даних (PII). */
+export interface PublicSlotSummary {
+  date: number;
+  start: number;
+  end: number;
+  zone: string;
+  pcs: number[];
+  status: "free" | "busy";
+  freeCount?: number;
+}
+
+/** Повний адмінський DTO бронювання з персональними даними (лише для адмін-чату та адмінів). */
+export interface AdminBookingDetails {
+  id: string;
+  rows: number[];
+  date: number;
+  start: number;
+  end: number;
+  pcs: number[];
+  name: string;
+  contact: string;
+  note: string;
+  statuses: string[];
+  clientTgId?: number | null;
+}
+
+/** Перетворити сирі рядки таблиці у публічні інтервали зайнятості без жодних PII. */
+export function toPublicBusySlots(
+  bookings: readonly SheetBooking[],
+  pcList: number[],
+  zones: Record<number, string>,
+): PublicSlotSummary[] {
+  const out: PublicSlotSummary[] = [];
+  for (const raw of bookings) {
+    const b = complete(raw);
+    if (!b) continue;
+    const pcs = pcsInRange(pcList, b.lo, b.hi);
+    const list = pcs.length ? pcs : [b.lo];
+    const byZone = new Map<string, number[]>();
+    for (const pc of list) {
+      const z = (zones[pc] ?? "").trim() || "Загальна";
+      const arr = byZone.get(z);
+      if (arr) arr.push(pc);
+      else byZone.set(z, [pc]);
+    }
+    for (const [zone, zonePcs] of byZone.entries()) {
+      out.push({ date: b.date, start: b.start, end: b.end, zone, pcs: zonePcs, status: "busy" });
+    }
+  }
+  return out;
+}
+
 /** Унікальні непорожні назви зон у порядку появи в `pcList`. */
 export function availableZones(pcList: number[], zones: Record<number, string>): string[] {
   const out: string[] = [];
@@ -255,16 +307,38 @@ export function intervalToBookingTime(startAbs: number, endAbs: number): { date:
   return { date, from, to };
 }
 
-function toCompleteList(bookings: readonly (SheetBooking | CompleteBooking)[]): CompleteBooking[] {
-  const out: CompleteBooking[] = [];
+interface BusyInterval {
+  start: number;
+  end: number;
+  lo?: number;
+  hi?: number;
+  pcs?: number[];
+}
+
+function isPublicSlot(b: SheetBooking | CompleteBooking | PublicSlotSummary | BusyInterval): b is PublicSlotSummary {
+  return "status" in b && Array.isArray((b as PublicSlotSummary).pcs);
+}
+
+function toBusyList(bookings: readonly (SheetBooking | CompleteBooking | PublicSlotSummary | BusyInterval)[]): BusyInterval[] {
+  const out: BusyInterval[] = [];
   for (const b of bookings) {
-    if ("lo" in b && "hi" in b && "start" in b && "end" in b) out.push(b);
-    else {
-      const c = complete(b);
-      if (c) out.push(c);
+    if (isPublicSlot(b)) {
+      if (b.status === "busy") out.push({ start: b.start, end: b.end, pcs: b.pcs });
+    } else if ("lo" in b && "hi" in b && "start" in b && "end" in b) {
+      out.push({ start: b.start, end: b.end, lo: b.lo, hi: b.hi });
+    } else if ("start" in b && "end" in b && ("pcs" in b || "lo" in b)) {
+      out.push(b);
+    } else {
+      const c = complete(b as SheetBooking);
+      if (c) out.push({ start: c.start, end: c.end, lo: c.lo, hi: c.hi });
     }
   }
   return out;
+}
+
+function occupiesPc(b: BusyInterval, pc: number): boolean {
+  if (b.pcs) return b.pcs.includes(pc);
+  return b.lo !== undefined && b.hi !== undefined && pc >= b.lo && pc <= b.hi;
 }
 
 export interface AllocateOpts {
@@ -272,7 +346,7 @@ export interface AllocateOpts {
   count: number;
   start: number;
   end: number;
-  bookings: readonly (SheetBooking | CompleteBooking)[];
+  bookings: readonly (SheetBooking | CompleteBooking | PublicSlotSummary | BusyInterval)[];
   preferredPcs?: number[];
   strictContiguous?: boolean;
 }
@@ -285,8 +359,8 @@ export interface AllocateOpts {
 export function allocateContiguousPCs(opts: AllocateOpts): number[] | null {
   const { zonePcs, count, start, end, bookings, preferredPcs, strictContiguous } = opts;
   const sortedZone = [...new Set(zonePcs)].sort((a, b) => a - b);
-  const overlapping = toCompleteList(bookings).filter((b) => intervalsOverlap({ start, end }, b));
-  const freePcs = sortedZone.filter((pc) => !overlapping.some((b) => pc >= b.lo && pc <= b.hi));
+  const overlapping = toBusyList(bookings).filter((b) => intervalsOverlap({ start, end }, b));
+  const freePcs = sortedZone.filter((pc) => !overlapping.some((b) => occupiesPc(b, pc)));
 
   if (preferredPcs?.length) {
     const uniq = [...new Set(preferredPcs)].sort((a, b) => a - b);
@@ -333,7 +407,7 @@ export interface StartTimesOpts {
   schedule: DaySchedule[];
   zonePcs: number[];
   count: number;
-  bookings: SheetBooking[];
+  bookings: readonly (SheetBooking | CompleteBooking | PublicSlotSummary)[];
   nowAbs: number;
   stepMinutes?: number;
   minDurationMinutes?: number;
@@ -346,7 +420,7 @@ export function findAvailableStartTimes(opts: StartTimesOpts): number[] {
   const w = windowOf(schedule, daySerial);
   if (w.end <= w.start) return [];
 
-  const relevant = toCompleteList(bookings).filter((b) => b.end > w.start && b.start < w.end + minDurationMinutes);
+  const relevant = toBusyList(bookings).filter((b) => b.end > w.start && b.start < w.end + minDurationMinutes);
   const out: number[] = [];
   for (let t = w.start; t < w.end; t += stepMinutes) {
     if (t < nowAbs) continue;
@@ -354,6 +428,46 @@ export function findAvailableStartTimes(opts: StartTimesOpts): number[] {
     if (allocateContiguousPCs({ zonePcs, count, start: t, end: t + minDurationMinutes, bookings: relevant, preferredPcs })) {
       out.push(t);
     }
+  }
+  return out;
+}
+
+/** Публічний звіт доступності слотів (без жодних PII) для обраного дня та зони. */
+export function findPublicSlotSummaries(opts: {
+  daySerial: number;
+  schedule: DaySchedule[];
+  zone: string;
+  zonePcs: number[];
+  count?: number;
+  busySlots: readonly PublicSlotSummary[];
+  nowAbs: number;
+  stepMinutes?: number;
+  minDurationMinutes?: number;
+}): PublicSlotSummary[] {
+  const { daySerial, schedule, zone, zonePcs, count = 1, busySlots, nowAbs, stepMinutes = 60, minDurationMinutes = 60 } = opts;
+  const w = windowOf(schedule, daySerial);
+  if (w.end <= w.start) return [];
+
+  const relevant = toBusyList(busySlots).filter((b) => b.end > w.start && b.start < w.end + minDurationMinutes);
+  const sortedZone = [...new Set(zonePcs)].sort((a, b) => a - b);
+  const out: PublicSlotSummary[] = [];
+
+  for (let t = w.start; t < w.end; t += stepMinutes) {
+    if (t < nowAbs) continue;
+    if (coveredUntil(schedule, Math.floor(t / MIN_PER_DAY), t) < t + minDurationMinutes) continue;
+    const end = t + minDurationMinutes;
+    const overlapping = relevant.filter((b) => intervalsOverlap({ start: t, end }, b));
+    const freePcs = sortedZone.filter((pc) => !overlapping.some((b) => occupiesPc(b, pc)));
+    const canFit = allocateContiguousPCs({ zonePcs: sortedZone, count, start: t, end, bookings: overlapping }) !== null;
+    out.push({
+      date: Math.floor(t / MIN_PER_DAY),
+      start: t,
+      end,
+      zone,
+      pcs: freePcs,
+      status: canFit ? "free" : "busy",
+      freeCount: freePcs.length,
+    });
   }
   return out;
 }
@@ -370,7 +484,7 @@ export interface DurationsOpts {
   schedule: DaySchedule[];
   zonePcs: number[];
   count: number;
-  bookings: SheetBooking[];
+  bookings: readonly (SheetBooking | CompleteBooking | PublicSlotSummary)[];
   preferredPcs?: number[];
   standardHours?: number[];
 }
@@ -382,7 +496,7 @@ export function findAvailableDurations(opts: DurationsOpts): DurationOption[] {
   if (!openWin) return [];
 
   const maxCovered = coveredUntil(schedule, Math.floor(startAbs / MIN_PER_DAY), startAbs);
-  const relevant = toCompleteList(bookings).filter((b) => b.end > startAbs && b.start < maxCovered);
+  const relevant = toBusyList(bookings).filter((b) => b.end > startAbs && b.start < maxCovered);
   const options: DurationOption[] = [];
 
   for (const h of standardHours) {

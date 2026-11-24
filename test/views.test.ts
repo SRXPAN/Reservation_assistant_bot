@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { parseBookingRows } from "../src/bookings";
+import { parseBookingRows, toPublicBusySlots } from "../src/bookings";
 import { parseSchedule } from "../src/hours";
 import { dateToSerial } from "../src/time";
-import { businessDay, countLabel, dayView, freeNowView, searchView, statusMark, toEntries } from "../src/views";
+import { businessDay, countLabel, dayView, freeNowView, publicAvailabilityView, searchView, statusMark, toEntries } from "../src/views";
 import { CLUB_HOURS_ROWS, PC_LIST, sheetRow } from "./helpers";
 
 const schedule = parseSchedule(CLUB_HOURS_ROWS);
@@ -120,5 +120,25 @@ describe("Пошук", () => {
   });
   it("нічого не знайдено; HTML екранується", () => {
     expect(searchView(entries, s, "<Петро>", now)).toBe("🔎 <b>Пошук «&lt;Петро&gt;»</b>\n\nНічого не знайдено.");
+  });
+});
+
+describe("Публічна доступність без PII", () => {
+  const zones = Object.fromEntries(PC_LIST.map((pc) => [pc, pc === 18 || pc === 19 ? "Stream" : "Regular"]));
+
+  it("publicAvailabilityView показує лише кількість вільних ПК по зонах і не містить жодних імен/телефонів", () => {
+    const busy = toPublicBusySlots(rows, PC_LIST, zones);
+    const text = publicAvailabilityView(busy, { ...s, zones }, at(FRI, 18, 30));
+    expect(text).toContain("🟢 <b>Вільні місця зараз</b> · пт 20.11 18:30");
+    expect(text).toContain("<b>Regular:</b> вільно 21 з 27 ПК");
+    expect(text).toContain("<b>Stream:</b> вільно 1 з 2 ПК");
+    for (const pii of ["Андрій", "Дмитро", "Ліза", "Нічний", "501", "234", "tg", "insta"]) {
+      expect(text).not.toContain(pii);
+    }
+  });
+
+  it("коли клуб зачинений — лише час відкриття", () => {
+    const busy = toPublicBusySlots(rows, PC_LIST, zones);
+    expect(publicAvailabilityView(busy, { ...s, zones }, at(SAT, 8))).toBe("🔒 Клуб зараз зачинений. Відкриття: сб 21.11 о 12:00.");
   });
 });

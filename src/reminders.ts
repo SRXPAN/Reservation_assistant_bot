@@ -2,7 +2,9 @@
 
 import { complete } from "./bookings";
 import { esc } from "./card";
+import { isAdmin } from "./config";
 import type { Deps, Who } from "./flow";
+import { safeError } from "./log";
 import {
   clientReminderText,
   planClientReminders,
@@ -13,7 +15,7 @@ import {
   type Action,
 } from "./notify";
 import { readSnapshot, updateNotes } from "./sheet";
-import { audit, getBinding, getClientBooking, listActiveClientBookingOwners } from "./store";
+import { audit, getAdminChannel, getAuthorizedClientBooking, listActiveClientBookingOwners } from "./store";
 import { formatHHMM, nowAbs, serialToDate, zonedNow } from "./time";
 import { dayView, toEntries } from "./views";
 
@@ -46,7 +48,7 @@ export interface RunResult {
 
 /** Надіслати все, що належить на зараз. Викликається з Cron кожні 5 хв (і /run-check). */
 export async function runReminders(d: Deps): Promise<RunResult> {
-  const binding = await getBinding(d.db);
+  const binding = await getAdminChannel(d.db, d.env);
   if (!binding) return { sent: 0, failed: 0, skipped: "гілку не прив'язано" };
   const tz = d.env.TZ || "Europe/Warsaw";
   const now = nowAbs(tz, d.now ? d.now() : new Date());
@@ -95,7 +97,7 @@ export async function runReminders(d: Deps): Promise<RunResult> {
       sent++;
     } catch (err) {
       // Не вдалося — звільняємо ключ, наступний запуск спробує ще раз.
-      console.error("Нагадування не надіслано", a.key, err);
+      console.error("Нагадування не надіслано", a.kind, a.kind === "reminder" ? a.entry.id || "manual" : a.day, safeError(err));
       await d.db.prepare("DELETE FROM sent_reminders WHERE key = ?1").bind(a.key).run();
       failed++;
     }
@@ -121,7 +123,7 @@ export async function runReminders(d: Deps): Promise<RunResult> {
       await d.db.prepare("UPDATE sent_reminders SET chat_id = ?2, message_id = ?3 WHERE key = ?1").bind(ca.key, ca.clientTgId, msg.message_id).run();
       sent++;
     } catch (err) {
-      console.error("Клієнтське нагадування не надіслано", ca.key, err);
+      console.error("Клієнтське нагадування не надіслано", ca.entry.id, safeError(err));
       if (!String(err).includes("403")) {
         await d.db.prepare("DELETE FROM sent_reminders WHERE key = ?1").bind(ca.key).run();
       }
@@ -158,6 +160,7 @@ export async function onAttendance(
   who: Who,
   answer: (r: { toast?: string; alert?: boolean }) => Promise<void>,
 ): Promise<void> {
+  if (!isAdmin(who.id, d.env)) return answer({ toast: "Немає доступу." });
   const r = await d.db.prepare("SELECT * FROM sent_reminders WHERE id = ?1").bind(q.reminderId).first<ReminderRow>();
   if (!r || r.chat_id !== q.chat_id || r.message_id !== q.message_id) return answer({ toast: "Нагадування застаріло" });
   await answer({ toast: "Записую в таблицю…" });
@@ -219,9 +222,9 @@ export async function onClientReminderConfirm(
   who: Who,
   answer: (r: { toast?: string; alert?: boolean }) => Promise<void>,
 ): Promise<void> {
-  const owner = await getClientBooking(d.db, bookingId);
-  if (!owner || owner.client_tg_id !== who.id || owner.status !== "active") {
-    await answer({ toast: "Бронь не знайдено або вже скасовано" });
+  const owner = await getAuthorizedClientBooking(d.db, bookingId, who.id, d.env);
+  if (!owner) {
+    await answer({ toast: "Бронь недоступна." });
     return;
   }
   await answer({ toast: "Підтверджую…" });

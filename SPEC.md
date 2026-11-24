@@ -188,3 +188,13 @@
 
 **Етап 8. Документація і запуск**
 - README (встановлення, секрети, команди `npm run bot:*`, міграції, як переключитися з тестової таблиці на робочу), перехід на робочу таблицю, тиждень спостереження за логами.
+
+---
+
+## Модель приватності та ізоляція даних (Private DM + Admin Channel + IDOR Protection)
+- **Приватний DM для клієнтів:** увесь клієнтський самозапис (`src/client_flow.ts`) дозволений виключно при `chat.type === 'private'`. Клієнтські `callback_query` (`c:*`) і контакти в групах блокуються.
+- **Редирект із публічних груп:** виклик бота в публічних/неприв'язаних групах (`/start`, `/book`, команди або згадка `@bot`) не розкриває жодних бронювань чи розкладу — бот відповідає коротким повідомленням із кнопкою переходу в DM (`https://t.me/<bot_username>?start=book`).
+- **Закритий адмін-канал та `isAdmin(userId, env)`:** доступ до адмін-команд (`/admin`, `/log`), повних карток (`src/flow.ts`) та відміток відвідуваності (`onAttendance`) перевіряється єдиною функцією `isAdmin(userId, env)` (`OWNER_ID` + `ADMIN_IDS`). Усі сповіщення про клієнтські броні/скасування з повними даними надсилаються виключно в закритий адмін-канал (`getAdminChannel`).
+- **Розділення DTO (`PublicSlotSummary` vs `AdminBookingDetails`):** клієнтський код отримує доступність лише через `readPublicSnapshot` (`PublicSlotSummary[]`: дата, час, зона, номери вільних/зайнятих ПК, статус — без `name`, `phone`, `username`, `clientTgId`, `notes`). `AdminBookingDetails` доступний лише адмінам.
+- **Ізоляція «Моїх бронювань» та захист від IDOR:** запити власних броней фільтруються на рівні SQL за `client_tg_id = currentUserId` (`listClientBookings`, `getClientBookingForUser`). Кожна дія з `bookingId` (`c:myview:`, `c:mycan:`, `c:mycanok:`, `c:rem:*`) проходить перевірку `getAuthorizedClientBooking(db, bookingId, userId, env)` і при невідповідності повертає нейтральну помилку «Бронь недоступна.» без розкриття існування запису.
+- **Гігієна логів:** `src/log.ts` (`safeError`, `redactPII`) запобігає потраплянню сирих телефонів, `@username` і `payload.text` у `console.error` / `console.warn`.
